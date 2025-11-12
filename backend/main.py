@@ -5,10 +5,15 @@ from contextlib import asynccontextmanager
 from typing import Optional
 from datetime import datetime, timedelta
 from database import connect_to_mongo, close_mongo_connection, get_database
-from models import UserCreate, UserLogin, UserResponse, Token
+from models import (
+    UserCreate, UserLogin, UserResponse, Token,
+    FriendRequestCreate, FriendRequestResponse, FriendResponse,
+    SessionCreate, SessionUpdate, SessionResponse, SessionMember
+)
 from auth import verify_password, get_password_hash, create_access_token, verify_token
 from bson import ObjectId
 from config import settings
+import socketio
 
 security = HTTPBearer(auto_error=False)
 
@@ -35,6 +40,257 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Socket.IO server
+sio = socketio.AsyncServer(
+    async_mode='asgi',
+    cors_allowed_origins='*',  # Allow all origins for Socket.IO
+    logger=True,
+    engineio_logger=True
+)
+
+# Store authenticated users: {sid: user_id}
+authenticated_users = {}
+
+async def jwt_auth_socket(sid, environ):
+    """Extract and validate JWT token from query string or cookie"""
+    import urllib.parse
+    
+    # Try to get token from query string
+    query = environ.get('QUERY_STRING', '')
+    token = None
+    
+    if 'token=' in query:
+        # Parse query string properly (handles URL encoding)
+        parsed_query = urllib.parse.parse_qs(query)
+        if 'token' in parsed_query and len(parsed_query['token']) > 0:
+            token = parsed_query['token'][0]
+    
+    # Optionally, get from cookie
+    if not token:
+        cookies = environ.get('HTTP_COOKIE', '')
+        for c in cookies.split(';'):
+            c = c.strip()
+            if c.startswith('access_token='):
+                token = c.split('=', 1)[1]
+                break
+    
+    if not token:
+        print(f"Socket connection rejected: No token found for sid={sid}")
+        return None
+    
+    # Remove Bearer prefix if present
+    if token.startswith('Bearer '):
+        token = token.split(' ', 1)[1]
+    
+    try:
+        # Decode and validate token using our verify_token function
+        token_data = verify_token(token)
+        if token_data is None:
+            print(f"Socket connection rejected: Invalid token for sid={sid}")
+            return None
+        
+        # Get user from database using email from token
+        db = get_database()
+        user = await db.users.find_one({"email": token_data.email})
+        if not user:
+            print(f"Socket connection rejected: User not found for email={token_data.email}")
+            return None
+        
+        return {
+            "user_id": str(user["_id"]),
+            "username": user["username"],
+            "email": user["email"]
+        }
+    except Exception as e:
+        print(f"Socket connection error: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+@sio.event
+async def connect(sid, environ):
+    """Handle socket connection with JWT authentication"""
+    try:
+        user_info = await jwt_auth_socket(sid, environ)
+        if not user_info:
+            print(f"Socket connection rejected: Authentication failed for sid={sid}")
+            return False
+        
+        # Store session info
+        authenticated_users[sid] = user_info
+        print(f"✅ Socket connected: sid={sid}, user_id={user_info['user_id']}, username={user_info['username']}")
+        await sio.emit('connected', {'message': 'Successfully connected'}, room=sid)
+        return True
+    except Exception as e:
+        print(f"Socket connect failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+@sio.event
+async def disconnect(sid):
+    """Handle socket disconnection"""
+    user_info = authenticated_users.pop(sid, {})
+    print(f"User {user_info.get('username', 'unknown')} disconnected: {sid}")
+
+@sio.event
+async def join_session(sid, data):
+    """Join a session room"""
+    if sid not in authenticated_users:
+        await sio.emit('error', {'message': 'Not authenticated'}, room=sid)
+        return
+    
+    session_id = data.get('session_id')
+    if not session_id:
+        await sio.emit('error', {'message': 'session_id required'}, room=sid)
+        return
+    
+    # Verify user has access to session
+    db = get_database()
+    user_id = authenticated_users[sid]["user_id"]
+    session = await db.sessions.find_one({"_id": ObjectId(session_id)})
+    
+    if not session:
+        await sio.emit('error', {'message': 'Session not found'}, room=sid)
+        return
+    
+    # Check access
+    if session["is_private"]:
+        is_host = session["host_id"] == user_id
+        is_member = any(m["user_id"] == user_id for m in session.get("members", []))
+        if not (is_host or is_member):
+            await sio.emit('error', {'message': 'Access denied'}, room=sid)
+            return
+    
+    # Join room
+    sio.enter_room(sid, f"session_{session_id}")
+    await sio.emit('joined_session', {'session_id': session_id}, room=sid)
+    
+    # Notify others in the session
+    await sio.emit('user_joined', {
+        'user_id': user_id,
+        'username': authenticated_users[sid]["username"]
+    }, room=f"session_{session_id}", skip_sid=sid)
+
+@sio.event
+async def leave_session(sid, data):
+    """Leave a session room"""
+    if sid not in authenticated_users:
+        return
+    
+    session_id = data.get('session_id')
+    if not session_id:
+        return
+    
+    user_id = authenticated_users[sid]["user_id"]
+    
+    # Leave room
+    sio.leave_room(sid, f"session_{session_id}")
+    await sio.emit('left_session', {'session_id': session_id}, room=sid)
+    
+    # Notify others in the session
+    await sio.emit('user_left', {
+        'user_id': user_id,
+        'username': authenticated_users[sid]["username"]
+    }, room=f"session_{session_id}", skip_sid=sid)
+
+@sio.event
+async def session_update(sid, data):
+    """Update session state (host only)"""
+    if sid not in authenticated_users:
+        await sio.emit('error', {'message': 'Not authenticated'}, room=sid)
+        return
+    
+    session_id = data.get('session_id')
+    if not session_id:
+        await sio.emit('error', {'message': 'session_id required'}, room=sid)
+        return
+    
+    db = get_database()
+    user_id = authenticated_users[sid]["user_id"]
+    session = await db.sessions.find_one({"_id": ObjectId(session_id)})
+    
+    if not session:
+        await sio.emit('error', {'message': 'Session not found'}, room=sid)
+        return
+    
+    # Only host can update
+    if session["host_id"] != user_id:
+        await sio.emit('error', {'message': 'Only host can update session'}, room=sid)
+        return
+    
+    # Update session in database
+    update_dict = {"updated_at": datetime.utcnow()}
+    if 'is_playing' in data:
+        update_dict["is_playing"] = data['is_playing']
+    if 'position_ms' in data:
+        update_dict["position_ms"] = data['position_ms']
+    if 'track_id' in data:
+        update_dict["track_id"] = data['track_id']
+    if 'track_name' in data:
+        update_dict["track_name"] = data['track_name']
+    if 'track_artist' in data:
+        update_dict["track_artist"] = data['track_artist']
+    
+    await db.sessions.update_one(
+        {"_id": ObjectId(session_id)},
+        {"$set": update_dict}
+    )
+    
+    # Broadcast update to all session members
+    await sio.emit('session_updated', {
+        'session_id': session_id,
+        'updates': data
+    }, room=f"session_{session_id}")
+
+@sio.on('chat:message')
+async def chat_message(sid, data):
+    """Handle chat messages in a session"""
+    if sid not in authenticated_users:
+        await sio.emit('error', {'message': 'Not authenticated'}, room=sid)
+        return
+    
+    session_id = data.get('session_id')
+    message = data.get('message')
+    
+    if not session_id or not message:
+        await sio.emit('error', {'message': 'session_id and message required'}, room=sid)
+        return
+    
+    # Verify user is in the session
+    db = get_database()
+    user_id = authenticated_users[sid]["user_id"]
+    session = await db.sessions.find_one({"_id": ObjectId(session_id)})
+    
+    if not session:
+        await sio.emit('error', {'message': 'Session not found'}, room=sid)
+        return
+    
+    # Check if user is a member or host
+    is_host = session["host_id"] == user_id
+    is_member = any(m["user_id"] == user_id for m in session.get("members", []))
+    
+    if not (is_host or is_member):
+        await sio.emit('error', {'message': 'You are not a member of this session'}, room=sid)
+        return
+    
+    # Broadcast message to all session members
+    await sio.emit('chat:message', {
+        'session_id': session_id,
+        'user_id': user_id,
+        'username': authenticated_users[sid]["username"],
+        'message': message,
+        'timestamp': datetime.utcnow().isoformat()
+    }, room=f"session_{session_id}")
+
+# Mount Socket.IO app in FastAPI
+# Create socket app without FastAPI app first (matching working pattern)
+# When mounted at /socket.io, the path prefix is stripped, so we use root path
+socket_app = socketio.ASGIApp(sio, socketio_path="/")
+
+# Mount the socket app in FastAPI at /socket.io
+app.mount("/socket.io", socket_app)
 
 async def get_current_user(token: Optional[str] = Cookie(None), credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
     """Get current authenticated user"""
@@ -162,4 +418,519 @@ async def logout(response: Response):
     """Logout by clearing the access token cookie"""
     response.delete_cookie(key="access_token")
     return {"message": "Successfully logged out"}
+
+# Friends endpoints
+@app.post("/api/friends/request", response_model=FriendRequestResponse, status_code=status.HTTP_201_CREATED)
+async def send_friend_request(
+    request_data: FriendRequestCreate,
+    current_user: dict = Depends(get_current_user)
+):
+    """Send a friend request to another user"""
+    db = get_database()
+    current_user_id = str(current_user["_id"])
+    recipient_id = request_data.recipient_id
+    
+    # Check if recipient exists
+    recipient = await db.users.find_one({"_id": ObjectId(recipient_id)})
+    if not recipient:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    # Can't send request to yourself
+    if current_user_id == recipient_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot send friend request to yourself"
+        )
+    
+    # Check if request already exists
+    existing_request = await db.friend_requests.find_one({
+        "$or": [
+            {"sender_id": current_user_id, "recipient_id": recipient_id},
+            {"sender_id": recipient_id, "recipient_id": current_user_id}
+        ]
+    })
+    
+    if existing_request:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Friend request already exists"
+        )
+    
+    # Check if already friends
+    existing_friendship = await db.friends.find_one({
+        "$or": [
+            {"user_id": current_user_id, "friend_id": recipient_id},
+            {"user_id": recipient_id, "friend_id": current_user_id}
+        ]
+    })
+    
+    if existing_friendship:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Users are already friends"
+        )
+    
+    # Create friend request
+    friend_request = {
+        "sender_id": current_user_id,
+        "recipient_id": recipient_id,
+        "status": "pending",
+        "created_at": datetime.utcnow()
+    }
+    
+    result = await db.friend_requests.insert_one(friend_request)
+    friend_request["id"] = str(result.inserted_id)
+    friend_request.pop("_id", None)
+    
+    return FriendRequestResponse(**friend_request)
+
+@app.get("/api/friends/requests", response_model=list[FriendRequestResponse])
+async def get_friend_requests(current_user: dict = Depends(get_current_user)):
+    """Get pending friend requests (sent and received)"""
+    db = get_database()
+    current_user_id = str(current_user["_id"])
+    
+    requests = await db.friend_requests.find({
+        "$or": [
+            {"sender_id": current_user_id, "status": "pending"},
+            {"recipient_id": current_user_id, "status": "pending"}
+        ]
+    }).to_list(length=100)
+    
+    result = []
+    for req in requests:
+        req["id"] = str(req["_id"])
+        req.pop("_id", None)
+        result.append(FriendRequestResponse(**req))
+    
+    return result
+
+@app.post("/api/friends/requests/{request_id}/accept", response_model=FriendResponse)
+async def accept_friend_request(
+    request_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Accept a friend request"""
+    db = get_database()
+    current_user_id = str(current_user["_id"])
+    
+    # Find the friend request
+    friend_request = await db.friend_requests.find_one({
+        "_id": ObjectId(request_id),
+        "recipient_id": current_user_id,
+        "status": "pending"
+    })
+    
+    if not friend_request:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Friend request not found"
+        )
+    
+    sender_id = friend_request["sender_id"]
+    
+    # Update request status
+    await db.friend_requests.update_one(
+        {"_id": ObjectId(request_id)},
+        {"$set": {"status": "accepted"}}
+    )
+    
+    # Create friendship in both directions
+    await db.friends.insert_one({
+        "user_id": current_user_id,
+        "friend_id": sender_id,
+        "created_at": datetime.utcnow()
+    })
+    
+    await db.friends.insert_one({
+        "user_id": sender_id,
+        "friend_id": current_user_id,
+        "created_at": datetime.utcnow()
+    })
+    
+    # Get sender info
+    sender = await db.users.find_one({"_id": ObjectId(sender_id)})
+    return FriendResponse(
+        id=str(sender["_id"]),
+        username=sender["username"],
+        email=sender["email"],
+        created_at=sender.get("created_at")
+    )
+
+@app.post("/api/friends/requests/{request_id}/reject")
+async def reject_friend_request(
+    request_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Reject a friend request"""
+    db = get_database()
+    current_user_id = str(current_user["_id"])
+    
+    # Find and update the friend request
+    result = await db.friend_requests.update_one(
+        {
+            "_id": ObjectId(request_id),
+            "recipient_id": current_user_id,
+            "status": "pending"
+        },
+        {"$set": {"status": "rejected"}}
+    )
+    
+    if result.matched_count == 0:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Friend request not found"
+        )
+    
+    return {"message": "Friend request rejected"}
+
+@app.get("/api/friends", response_model=list[FriendResponse])
+async def get_friends(current_user: dict = Depends(get_current_user)):
+    """Get list of friends"""
+    db = get_database()
+    current_user_id = str(current_user["_id"])
+    
+    # Get all friendships where current user is involved
+    friendships = await db.friends.find({"user_id": current_user_id}).to_list(length=100)
+    
+    friend_ids = [ObjectId(f["friend_id"]) for f in friendships]
+    
+    if not friend_ids:
+        return []
+    
+    # Get friend user details
+    friends = await db.users.find({"_id": {"$in": friend_ids}}).to_list(length=100)
+    
+    result = []
+    for friend in friends:
+        result.append(FriendResponse(
+            id=str(friend["_id"]),
+            username=friend["username"],
+            email=friend["email"],
+            created_at=friend.get("created_at")
+        ))
+    
+    return result
+
+@app.delete("/api/friends/{friend_id}")
+async def remove_friend(
+    friend_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Remove a friend"""
+    db = get_database()
+    current_user_id = str(current_user["_id"])
+    
+    # Remove friendship in both directions
+    await db.friends.delete_many({
+        "$or": [
+            {"user_id": current_user_id, "friend_id": friend_id},
+            {"user_id": friend_id, "friend_id": current_user_id}
+        ]
+    })
+    
+    # Also delete any related friend requests
+    await db.friend_requests.delete_many({
+        "$or": [
+            {"sender_id": current_user_id, "recipient_id": friend_id},
+            {"sender_id": friend_id, "recipient_id": current_user_id}
+        ]
+    })
+    
+    return {"message": "Friend removed successfully"}
+
+# Session endpoints
+@app.post("/api/sessions", response_model=SessionResponse, status_code=status.HTTP_201_CREATED)
+async def create_session(
+    session_data: SessionCreate,
+    current_user: dict = Depends(get_current_user)
+):
+    """Create a new listening session"""
+    db = get_database()
+    current_user_id = str(current_user["_id"])
+    
+    session_doc = {
+        "name": session_data.name,
+        "description": session_data.description,
+        "host_id": current_user_id,
+        "host_username": current_user["username"],
+        "platform": session_data.platform,
+        "track_id": session_data.track_id,
+        "track_name": session_data.track_name,
+        "track_artist": session_data.track_artist,
+        "is_playing": False,
+        "position_ms": 0,
+        "is_private": session_data.is_private,
+        "members": [{
+            "user_id": current_user_id,
+            "username": current_user["username"],
+            "joined_at": datetime.utcnow()
+        }],
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow()
+    }
+    
+    result = await db.sessions.insert_one(session_doc)
+    session_doc["id"] = str(result.inserted_id)
+    session_doc.pop("_id", None)
+    
+    # Convert members to SessionMember objects
+    session_doc["members"] = [SessionMember(**m) for m in session_doc["members"]]
+    
+    return SessionResponse(**session_doc)
+
+@app.get("/api/sessions", response_model=list[SessionResponse])
+async def list_sessions(
+    current_user: dict = Depends(get_current_user),
+    private_only: bool = False
+):
+    """List all sessions (public or user's private sessions)"""
+    db = get_database()
+    current_user_id = str(current_user["_id"])
+    
+    query = {}
+    if private_only:
+        query = {
+            "$or": [
+                {"host_id": current_user_id},
+                {"members.user_id": current_user_id}
+            ]
+        }
+    else:
+        query = {
+            "$or": [
+                {"is_private": False},
+                {"host_id": current_user_id},
+                {"members.user_id": current_user_id}
+            ]
+        }
+    
+    sessions = await db.sessions.find(query).sort("created_at", -1).to_list(length=100)
+    
+    result = []
+    for session in sessions:
+        session["id"] = str(session["_id"])
+        session.pop("_id", None)
+        session["members"] = [SessionMember(**m) for m in session["members"]]
+        result.append(SessionResponse(**session))
+    
+    return result
+
+@app.get("/api/sessions/{session_id}", response_model=SessionResponse)
+async def get_session(
+    session_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get a specific session"""
+    db = get_database()
+    current_user_id = str(current_user["_id"])
+    
+    session = await db.sessions.find_one({"_id": ObjectId(session_id)})
+    
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found"
+        )
+    
+    # Check if user has access (public or member/host)
+    if session["is_private"]:
+        is_host = session["host_id"] == current_user_id
+        is_member = any(m["user_id"] == current_user_id for m in session.get("members", []))
+        if not (is_host or is_member):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to private session"
+            )
+    
+    session["id"] = str(session["_id"])
+    session.pop("_id", None)
+    session["members"] = [SessionMember(**m) for m in session.get("members", [])]
+    
+    return SessionResponse(**session)
+
+@app.post("/api/sessions/{session_id}/join", response_model=SessionResponse)
+async def join_session(
+    session_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Join a session"""
+    db = get_database()
+    current_user_id = str(current_user["_id"])
+    
+    session = await db.sessions.find_one({"_id": ObjectId(session_id)})
+    
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found"
+        )
+    
+    # Check if user has access
+    if session["is_private"]:
+        is_host = session["host_id"] == current_user_id
+        is_member = any(m["user_id"] == current_user_id for m in session.get("members", []))
+        if not (is_host or is_member):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to private session"
+            )
+    
+    # Check if already a member
+    is_member = any(m["user_id"] == current_user_id for m in session.get("members", []))
+    if is_member:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Already a member of this session"
+        )
+    
+    # Add user to members
+    await db.sessions.update_one(
+        {"_id": ObjectId(session_id)},
+        {
+            "$push": {
+                "members": {
+                    "user_id": current_user_id,
+                    "username": current_user["username"],
+                    "joined_at": datetime.utcnow()
+                }
+            },
+            "$set": {"updated_at": datetime.utcnow()}
+        }
+    )
+    
+    # Return updated session
+    updated_session = await db.sessions.find_one({"_id": ObjectId(session_id)})
+    updated_session["id"] = str(updated_session["_id"])
+    updated_session.pop("_id", None)
+    updated_session["members"] = [SessionMember(**m) for m in updated_session.get("members", [])]
+    
+    return SessionResponse(**updated_session)
+
+@app.post("/api/sessions/{session_id}/leave", response_model=SessionResponse)
+async def leave_session(
+    session_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Leave a session"""
+    db = get_database()
+    current_user_id = str(current_user["_id"])
+    
+    session = await db.sessions.find_one({"_id": ObjectId(session_id)})
+    
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found"
+        )
+    
+    # Can't leave if you're the host
+    if session["host_id"] == current_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Host cannot leave session. Delete the session instead."
+        )
+    
+    # Remove user from members
+    await db.sessions.update_one(
+        {"_id": ObjectId(session_id)},
+        {
+            "$pull": {"members": {"user_id": current_user_id}},
+            "$set": {"updated_at": datetime.utcnow()}
+        }
+    )
+    
+    # Return updated session
+    updated_session = await db.sessions.find_one({"_id": ObjectId(session_id)})
+    updated_session["id"] = str(updated_session["_id"])
+    updated_session.pop("_id", None)
+    updated_session["members"] = [SessionMember(**m) for m in updated_session.get("members", [])]
+    
+    return SessionResponse(**updated_session)
+
+@app.put("/api/sessions/{session_id}", response_model=SessionResponse)
+async def update_session(
+    session_id: str,
+    session_data: SessionUpdate,
+    current_user: dict = Depends(get_current_user)
+):
+    """Update a session (host only)"""
+    db = get_database()
+    current_user_id = str(current_user["_id"])
+    
+    session = await db.sessions.find_one({"_id": ObjectId(session_id)})
+    
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found"
+        )
+    
+    # Only host can update
+    if session["host_id"] != current_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the host can update the session"
+        )
+    
+    # Build update dict
+    update_dict = {"updated_at": datetime.utcnow()}
+    if session_data.name is not None:
+        update_dict["name"] = session_data.name
+    if session_data.description is not None:
+        update_dict["description"] = session_data.description
+    if session_data.track_id is not None:
+        update_dict["track_id"] = session_data.track_id
+    if session_data.track_name is not None:
+        update_dict["track_name"] = session_data.track_name
+    if session_data.track_artist is not None:
+        update_dict["track_artist"] = session_data.track_artist
+    if session_data.is_playing is not None:
+        update_dict["is_playing"] = session_data.is_playing
+    if session_data.position_ms is not None:
+        update_dict["position_ms"] = session_data.position_ms
+    
+    await db.sessions.update_one(
+        {"_id": ObjectId(session_id)},
+        {"$set": update_dict}
+    )
+    
+    # Return updated session
+    updated_session = await db.sessions.find_one({"_id": ObjectId(session_id)})
+    updated_session["id"] = str(updated_session["_id"])
+    updated_session.pop("_id", None)
+    updated_session["members"] = [SessionMember(**m) for m in updated_session.get("members", [])]
+    
+    return SessionResponse(**updated_session)
+
+@app.delete("/api/sessions/{session_id}")
+async def delete_session(
+    session_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Delete a session (host only)"""
+    db = get_database()
+    current_user_id = str(current_user["_id"])
+    
+    session = await db.sessions.find_one({"_id": ObjectId(session_id)})
+    
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found"
+        )
+    
+    # Only host can delete
+    if session["host_id"] != current_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the host can delete the session"
+        )
+    
+    await db.sessions.delete_one({"_id": ObjectId(session_id)})
+    
+    return {"message": "Session deleted successfully"}
 

@@ -1,13 +1,38 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
+import { Link } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { Users, Video, Share2 } from 'lucide-react';
 import MoviePlayer from '../components/MoviePlayer';
-import { mockMovies, onlineFriends } from '../data/mockData';
+import { mockMovies } from '../data/mockData';
+import { api } from '../utils/api';
+import { useAuth } from '../contexts/AuthContext';
 
 const StreamMoviesPage = () => {
+  const { user } = useAuth();
   const [activeTab, setActiveTab] = useState('prime');
   const [selectedMovie, setSelectedMovie] = useState(null);
   const [showWebcam, setShowWebcam] = useState(true);
+  const [friends, setFriends] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (user) {
+      loadFriends();
+    } else {
+      setLoading(false);
+    }
+  }, [user]);
+
+  const loadFriends = async () => {
+    try {
+      const data = await api.getFriends();
+      setFriends(data);
+    } catch (err) {
+      console.error('Error loading friends:', err);
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const tabs = [
     { id: 'prime', label: 'Prime Video' },
@@ -111,36 +136,51 @@ const StreamMoviesPage = () => {
           <div className="glass-effect rounded-2xl p-6">
             <h3 className="text-xl font-semibold mb-4 flex items-center gap-2">
               <Users className="w-5 h-5" />
-              Online Friends
+              My Friends
             </h3>
-            <div className="space-y-4">
-              {onlineFriends.map(friend => (
-                <div key={friend.id} className="flex items-center gap-3 p-3 rounded-xl hover:bg-glass transition-colors">
-                  <div className="relative">
-                    <img 
-                      src={friend.avatar} 
-                      alt={friend.name}
-                      className="w-12 h-12 rounded-full"
-                    />
-                    <div className={`absolute bottom-0 right-0 w-3 h-3 rounded-full border-2 border-darker ${
-                      friend.status === 'online' ? 'bg-green-500' : 'bg-yellow-500'
-                    }`}></div>
-                  </div>
-                  <div className="flex-1">
-                    <div className="font-semibold">{friend.name}</div>
-                    <div className="text-sm text-gray-400 capitalize">{friend.status}</div>
-                  </div>
-                  <button className="p-2 hover:bg-primary rounded-lg transition-colors">
-                    <Share2 className="w-4 h-4" />
-                  </button>
+            {loading ? (
+              <div className="text-center text-gray-400 py-8">Loading...</div>
+            ) : friends.length === 0 ? (
+              <div className="text-center text-gray-400 py-8">
+                <p className="mb-4">No friends yet</p>
+                <Link
+                  to="/friends"
+                  className="text-primary hover:underline"
+                >
+                  Add friends
+                </Link>
+              </div>
+            ) : (
+              <>
+                <div className="space-y-4">
+                  {friends.map(friend => (
+                    <div key={friend.id} className="flex items-center gap-3 p-3 rounded-xl hover:bg-glass transition-colors">
+                      <div className="relative">
+                        <div className="w-12 h-12 rounded-full bg-primary/20 flex items-center justify-center">
+                          <Users className="w-6 h-6 text-primary" />
+                        </div>
+                        <div className="absolute bottom-0 right-0 w-3 h-3 rounded-full border-2 border-darker bg-green-500"></div>
+                      </div>
+                      <div className="flex-1">
+                        <div className="font-semibold">{friend.username}</div>
+                        <div className="text-sm text-gray-400">Friend</div>
+                      </div>
+                      <button className="p-2 hover:bg-primary rounded-lg transition-colors">
+                        <Share2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  ))}
                 </div>
-              ))}
-            </div>
-            
-            <button className="w-full mt-6 bg-accent hover:bg-blue-500 text-white py-3 rounded-xl font-semibold transition-colors flex items-center justify-center gap-2">
-              <Share2 className="w-4 h-4" />
-              Invite Friend
-            </button>
+                
+                <Link
+                  to="/friends"
+                  className="w-full mt-6 bg-accent hover:bg-blue-500 text-white py-3 rounded-xl font-semibold transition-colors flex items-center justify-center gap-2 block text-center"
+                >
+                  <Share2 className="w-4 h-4" />
+                  Manage Friends
+                </Link>
+              </>
+            )}
           </div>
         </div>
       </div>

@@ -43,6 +43,16 @@ const Navigation = () => {
           >
             Stream Movies
           </Link>
+          <Link 
+            to="/friends" 
+            className={`px-4 py-2 rounded-lg transition-all duration-300 ${
+              location.pathname === '/friends' 
+                ? 'bg-primary text-white shadow-lg' 
+                : 'hover:bg-glass hover:text-primary'
+            }`}
+          >
+            Friends
+          </Link>
         </div>
         
         <div className="flex items-center space-x-4">

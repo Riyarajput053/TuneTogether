@@ -86,6 +86,95 @@ export const api = {
     const data = await this.request('/api/auth/me');
     return data;
   },
+
+  // Friends API
+  async getFriends() {
+    const data = await this.request('/api/friends');
+    return data;
+  },
+
+  async sendFriendRequest(recipientId) {
+    const data = await this.request('/api/friends/request', {
+      method: 'POST',
+      body: JSON.stringify({ recipient_id: recipientId }),
+    });
+    return data;
+  },
+
+  async getFriendRequests() {
+    const data = await this.request('/api/friends/requests');
+    return data;
+  },
+
+  async acceptFriendRequest(requestId) {
+    const data = await this.request(`/api/friends/requests/${requestId}/accept`, {
+      method: 'POST',
+    });
+    return data;
+  },
+
+  async rejectFriendRequest(requestId) {
+    const data = await this.request(`/api/friends/requests/${requestId}/reject`, {
+      method: 'POST',
+    });
+    return data;
+  },
+
+  async removeFriend(friendId) {
+    const data = await this.request(`/api/friends/${friendId}`, {
+      method: 'DELETE',
+    });
+    return data;
+  },
+
+  // Sessions API
+  async createSession(sessionData) {
+    const data = await this.request('/api/sessions', {
+      method: 'POST',
+      body: JSON.stringify(sessionData),
+    });
+    return data;
+  },
+
+  async getSessions(privateOnly = false) {
+    const params = privateOnly ? '?private_only=true' : '';
+    const data = await this.request(`/api/sessions${params}`);
+    return data;
+  },
+
+  async getSession(sessionId) {
+    const data = await this.request(`/api/sessions/${sessionId}`);
+    return data;
+  },
+
+  async joinSession(sessionId) {
+    const data = await this.request(`/api/sessions/${sessionId}/join`, {
+      method: 'POST',
+    });
+    return data;
+  },
+
+  async leaveSession(sessionId) {
+    const data = await this.request(`/api/sessions/${sessionId}/leave`, {
+      method: 'POST',
+    });
+    return data;
+  },
+
+  async updateSession(sessionId, updates) {
+    const data = await this.request(`/api/sessions/${sessionId}`, {
+      method: 'PUT',
+      body: JSON.stringify(updates),
+    });
+    return data;
+  },
+
+  async deleteSession(sessionId) {
+    const data = await this.request(`/api/sessions/${sessionId}`, {
+      method: 'DELETE',
+    });
+    return data;
+  },
 };
 
 export { getAuthToken, setAuthToken, removeAuthToken };
