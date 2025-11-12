@@ -45,12 +45,18 @@ class TokenData(BaseModel):
 
 # Friend models
 class FriendRequestCreate(BaseModel):
-    recipient_id: str
+    recipient_id: Optional[str] = None
+    recipient_email: Optional[EmailStr] = None
+    recipient_username: Optional[str] = None
 
 class FriendRequestResponse(BaseModel):
     id: str
     sender_id: str
+    sender_username: str
+    sender_email: str
     recipient_id: str
+    recipient_username: str
+    recipient_email: str
     status: str  # "pending", "accepted", "rejected"
     created_at: datetime
     

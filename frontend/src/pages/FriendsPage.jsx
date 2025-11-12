@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useAuth } from '../contexts/AuthContext';
 import { api } from '../utils/api';
 import { UserPlus, Check, X, Users, Search } from 'lucide-react';
@@ -11,10 +11,18 @@ export default function FriendsPage() {
   const [searchResults, setSearchResults] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const searchTimeoutRef = useRef(null);
 
   useEffect(() => {
     loadFriends();
     loadFriendRequests();
+    
+    // Cleanup timeout on unmount
+    return () => {
+      if (searchTimeoutRef.current) {
+        clearTimeout(searchTimeoutRef.current);
+      }
+    };
   }, []);
 
   const loadFriends = async () => {
@@ -37,25 +45,50 @@ export default function FriendsPage() {
     }
   };
 
-  const searchUsers = async () => {
-    if (!searchQuery.trim()) {
+  const searchUsers = async (query = null) => {
+    const queryToUse = query !== null ? query : searchQuery.trim();
+    
+    if (!queryToUse) {
+      setSearchResults([]);
+      return;
+    }
+
+    if (queryToUse.length < 2) {
       setSearchResults([]);
       return;
     }
 
     try {
-      // Note: This would require a search endpoint on the backend
-      // For now, we'll show a message that search is not implemented
-      setError('User search not yet implemented. Use friend ID to send requests.');
+      const results = await api.searchUsers(queryToUse);
+      setSearchResults(results);
+      setError(null);
     } catch (err) {
       setError(err.message);
+      setSearchResults([]);
     }
   };
 
-  const sendFriendRequest = async (recipientId) => {
+  const sendFriendRequest = async (user) => {
     try {
-      await api.sendFriendRequest(recipientId);
+      // user should be an object with id, email, or username
+      let recipientId = null;
+      let recipientEmail = null;
+      let recipientUsername = null;
+
+      if (user.id) {
+        recipientId = user.id;
+      } else if (user.email) {
+        recipientEmail = user.email;
+      } else if (user.username) {
+        recipientUsername = user.username;
+      } else {
+        throw new Error('Invalid user data');
+      }
+
+      await api.sendFriendRequest(recipientId, recipientEmail, recipientUsername);
       setError(null);
+      setSearchQuery('');
+      setSearchResults([]);
       await loadFriendRequests();
       alert('Friend request sent!');
     } catch (err) {
@@ -131,88 +164,187 @@ export default function FriendsPage() {
         <div className="glass-effect rounded-2xl p-6 mb-8">
           <h2 className="text-2xl font-semibold mb-4 flex items-center gap-2">
             <UserPlus className="w-6 h-6" />
-            Send Friend Request
+            Add Friend
           </h2>
-          <div className="flex gap-2">
-            <input
-              type="text"
-              placeholder="Enter user ID to send friend request"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              className="flex-1 bg-glass border border-gray-600 rounded-xl px-4 py-3 focus:outline-none focus:border-primary"
-            />
+          <div className="flex gap-2 mb-4">
+            <div className="flex-1 relative">
+              <input
+                type="text"
+                placeholder="Search by email or username..."
+                value={searchQuery}
+                onChange={(e) => {
+                  const value = e.target.value;
+                  setSearchQuery(value);
+                  
+                  // Clear previous timeout
+                  if (searchTimeoutRef.current) {
+                    clearTimeout(searchTimeoutRef.current);
+                  }
+                  
+                  if (value.trim().length >= 2) {
+                    // Debounce search by 500ms
+                    const queryValue = value.trim();
+                    searchTimeoutRef.current = setTimeout(() => {
+                      searchUsers(queryValue);
+                    }, 500);
+                  } else {
+                    setSearchResults([]);
+                  }
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && searchQuery.trim().length >= 2) {
+                    searchUsers();
+                  }
+                }}
+                className="w-full bg-glass border border-gray-600 rounded-xl px-4 py-3 pl-10 focus:outline-none focus:border-primary"
+              />
+              <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-5 h-5 text-gray-400" />
+            </div>
             <button
               onClick={() => {
-                if (searchQuery.trim()) {
-                  sendFriendRequest(searchQuery.trim());
-                  setSearchQuery('');
+                if (searchTimeoutRef.current) {
+                  clearTimeout(searchTimeoutRef.current);
                 }
+                searchUsers();
               }}
-              className="bg-primary hover:bg-green-600 text-white px-6 py-3 rounded-xl font-semibold transition-all duration-300"
+              className="bg-primary hover:bg-green-600 text-white px-6 py-3 rounded-xl font-semibold transition-all duration-300 flex items-center gap-2"
             >
-              Send Request
+              <Search className="w-5 h-5" />
+              Search
             </button>
           </div>
-          <p className="text-gray-400 text-sm mt-2">
-            Note: You need the user's ID to send a friend request. User search will be available soon.
-          </p>
+
+          {/* Search Results */}
+          {searchResults.length > 0 && (
+            <div className="mt-4 space-y-2">
+              <p className="text-sm text-gray-400">Search Results:</p>
+              {searchResults.map((user) => {
+                // Check if already friends
+                const isFriend = friends.some(f => f.id === user.id);
+                // Check if request already sent
+                const requestSent = pendingSent.some(r => r.recipient_id === user.id);
+                // Check if request received
+                const requestReceived = pendingReceived.some(r => r.sender_id === user.id);
+
+                return (
+                  <div
+                    key={user.id}
+                    className="bg-glass rounded-xl p-4 flex items-center justify-between hover:bg-glass/80 transition-colors"
+                  >
+                    <div>
+                      <h3 className="font-semibold">{user.username}</h3>
+                      <p className="text-sm text-gray-400">{user.email}</p>
+                    </div>
+                    <div>
+                      {isFriend ? (
+                        <span className="text-green-400 text-sm">Already friends</span>
+                      ) : requestSent ? (
+                        <span className="text-yellow-400 text-sm">Request sent</span>
+                      ) : requestReceived ? (
+                        <span className="text-blue-400 text-sm">Request received</span>
+                      ) : (
+                        <button
+                          onClick={() => sendFriendRequest(user)}
+                          className="bg-primary hover:bg-green-600 text-white px-4 py-2 rounded-lg transition-colors flex items-center gap-2"
+                        >
+                          <UserPlus className="w-4 h-4" />
+                          Add Friend
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {searchQuery.trim().length > 0 && searchQuery.trim().length < 2 && (
+            <p className="text-gray-400 text-sm mt-2">
+              Type at least 2 characters to search
+            </p>
+          )}
         </div>
 
-        {/* Pending Friend Requests */}
-        {pendingReceived.length > 0 && (
+        {/* Friend Requests Section */}
+        {(pendingReceived.length > 0 || pendingSent.length > 0) && (
           <div className="glass-effect rounded-2xl p-6 mb-8">
-            <h2 className="text-2xl font-semibold mb-4">Pending Requests</h2>
-            <div className="space-y-3">
-              {pendingReceived.map((request) => (
-                <div
-                  key={request.id}
-                  className="bg-glass rounded-xl p-4 flex items-center justify-between"
-                >
-                  <div>
-                    <p className="font-semibold">Request from user: {request.sender_id}</p>
-                    <p className="text-sm text-gray-400">
-                      {new Date(request.created_at).toLocaleDateString()}
-                    </p>
-                  </div>
-                  <div className="flex gap-2">
-                    <button
-                      onClick={() => acceptFriendRequest(request.id)}
-                      className="bg-primary hover:bg-green-600 text-white px-4 py-2 rounded-lg transition-colors flex items-center gap-2"
-                    >
-                      <Check className="w-4 h-4" />
-                      Accept
-                    </button>
-                    <button
-                      onClick={() => rejectFriendRequest(request.id)}
-                      className="bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded-lg transition-colors flex items-center gap-2"
-                    >
-                      <X className="w-4 h-4" />
-                      Reject
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
+            <h2 className="text-2xl font-semibold mb-6 flex items-center gap-2">
+              <UserPlus className="w-6 h-6" />
+              Friend Requests
+            </h2>
 
-        {/* Sent Requests */}
-        {pendingSent.length > 0 && (
-          <div className="glass-effect rounded-2xl p-6 mb-8">
-            <h2 className="text-2xl font-semibold mb-4">Sent Requests</h2>
-            <div className="space-y-3">
-              {pendingSent.map((request) => (
-                <div
-                  key={request.id}
-                  className="bg-glass rounded-xl p-4"
-                >
-                  <p className="font-semibold">Request to user: {request.recipient_id}</p>
-                  <p className="text-sm text-gray-400">
-                    Status: {request.status} • {new Date(request.created_at).toLocaleDateString()}
-                  </p>
+            {/* Received Requests */}
+            {pendingReceived.length > 0 && (
+              <div className="mb-6">
+                <h3 className="text-lg font-semibold mb-3 text-gray-300">
+                  Received ({pendingReceived.length})
+                </h3>
+                <div className="space-y-3">
+                  {pendingReceived.map((request) => (
+                    <div
+                      key={request.id}
+                      className="bg-glass rounded-xl p-4 flex items-center justify-between hover:bg-glass/80 transition-colors"
+                    >
+                      <div className="flex-1">
+                        <p className="font-semibold text-lg">{request.sender_username}</p>
+                        <p className="text-sm text-gray-400">{request.sender_email}</p>
+                        <p className="text-xs text-gray-500 mt-1">
+                          {new Date(request.created_at).toLocaleDateString()} at{' '}
+                          {new Date(request.created_at).toLocaleTimeString()}
+                        </p>
+                      </div>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => acceptFriendRequest(request.id)}
+                          className="bg-primary hover:bg-green-600 text-white px-4 py-2 rounded-lg transition-colors flex items-center gap-2"
+                        >
+                          <Check className="w-4 h-4" />
+                          Accept
+                        </button>
+                        <button
+                          onClick={() => rejectFriendRequest(request.id)}
+                          className="bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded-lg transition-colors flex items-center gap-2"
+                        >
+                          <X className="w-4 h-4" />
+                          Decline
+                        </button>
+                      </div>
+                    </div>
+                  ))}
                 </div>
-              ))}
-            </div>
+              </div>
+            )}
+
+            {/* Sent Requests */}
+            {pendingSent.length > 0 && (
+              <div>
+                <h3 className="text-lg font-semibold mb-3 text-gray-300">
+                  Sent ({pendingSent.length})
+                </h3>
+                <div className="space-y-3">
+                  {pendingSent.map((request) => (
+                    <div
+                      key={request.id}
+                      className="bg-glass rounded-xl p-4 hover:bg-glass/80 transition-colors"
+                    >
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <p className="font-semibold text-lg">{request.recipient_username}</p>
+                          <p className="text-sm text-gray-400">{request.recipient_email}</p>
+                          <p className="text-xs text-gray-500 mt-1">
+                            Sent {new Date(request.created_at).toLocaleDateString()} at{' '}
+                            {new Date(request.created_at).toLocaleTimeString()}
+                          </p>
+                        </div>
+                        <span className="px-3 py-1 bg-yellow-500/20 text-yellow-400 rounded-lg text-sm">
+                          Pending
+                        </span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         )}
 

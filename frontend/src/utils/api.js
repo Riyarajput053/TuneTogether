@@ -93,10 +93,24 @@ export const api = {
     return data;
   },
 
-  async sendFriendRequest(recipientId) {
+  async searchUsers(query) {
+    const data = await this.request(`/api/users/search?query=${encodeURIComponent(query)}`);
+    return data;
+  },
+
+  async sendFriendRequest(recipientId, recipientEmail = null, recipientUsername = null) {
+    const body = {};
+    if (recipientId) {
+      body.recipient_id = recipientId;
+    } else if (recipientEmail) {
+      body.recipient_email = recipientEmail;
+    } else if (recipientUsername) {
+      body.recipient_username = recipientUsername;
+    }
+    
     const data = await this.request('/api/friends/request', {
       method: 'POST',
-      body: JSON.stringify({ recipient_id: recipientId }),
+      body: JSON.stringify(body),
     });
     return data;
   },

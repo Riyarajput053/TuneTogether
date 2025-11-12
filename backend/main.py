@@ -413,6 +413,41 @@ async def get_current_user_info(current_user: dict = Depends(get_current_user)):
         created_at=current_user.get("created_at")
     )
 
+@app.get("/api/users/search", response_model=list[UserResponse])
+async def search_users(
+    query: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Search users by email or username"""
+    if not query or len(query.strip()) < 2:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Query must be at least 2 characters"
+        )
+    
+    db = get_database()
+    query_lower = query.strip().lower()
+    
+    # Search by email or username (case-insensitive)
+    users = await db.users.find({
+        "$or": [
+            {"email": {"$regex": query_lower, "$options": "i"}},
+            {"username": {"$regex": query_lower, "$options": "i"}}
+        ],
+        "_id": {"$ne": current_user["_id"]}  # Exclude current user
+    }).limit(10).to_list(length=10)
+    
+    result = []
+    for user in users:
+        result.append(UserResponse(
+            id=str(user["_id"]),
+            username=user["username"],
+            email=user["email"],
+            created_at=user.get("created_at")
+        ))
+    
+    return result
+
 @app.post("/api/auth/logout")
 async def logout(response: Response):
     """Logout by clearing the access token cookie"""
@@ -425,18 +460,31 @@ async def send_friend_request(
     request_data: FriendRequestCreate,
     current_user: dict = Depends(get_current_user)
 ):
-    """Send a friend request to another user"""
+    """Send a friend request to another user by ID, email, or username"""
     db = get_database()
     current_user_id = str(current_user["_id"])
-    recipient_id = request_data.recipient_id
     
-    # Check if recipient exists
-    recipient = await db.users.find_one({"_id": ObjectId(recipient_id)})
+    # Find recipient by ID, email, or username
+    recipient = None
+    if request_data.recipient_id:
+        recipient = await db.users.find_one({"_id": ObjectId(request_data.recipient_id)})
+    elif request_data.recipient_email:
+        recipient = await db.users.find_one({"email": request_data.recipient_email.lower()})
+    elif request_data.recipient_username:
+        recipient = await db.users.find_one({"username": {"$regex": f"^{request_data.recipient_username}$", "$options": "i"}})
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Must provide recipient_id, recipient_email, or recipient_username"
+        )
+    
     if not recipient:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found"
         )
+    
+    recipient_id = str(recipient["_id"])
     
     # Can't send request to yourself
     if current_user_id == recipient_id:
@@ -485,7 +533,19 @@ async def send_friend_request(
     friend_request["id"] = str(result.inserted_id)
     friend_request.pop("_id", None)
     
-    return FriendRequestResponse(**friend_request)
+    # Get sender and recipient info for response
+    sender = current_user
+    return FriendRequestResponse(
+        id=friend_request["id"],
+        sender_id=current_user_id,
+        sender_username=sender["username"],
+        sender_email=sender["email"],
+        recipient_id=recipient_id,
+        recipient_username=recipient["username"],
+        recipient_email=recipient["email"],
+        status=friend_request["status"],
+        created_at=friend_request["created_at"]
+    )
 
 @app.get("/api/friends/requests", response_model=list[FriendRequestResponse])
 async def get_friend_requests(current_user: dict = Depends(get_current_user)):
@@ -502,9 +562,22 @@ async def get_friend_requests(current_user: dict = Depends(get_current_user)):
     
     result = []
     for req in requests:
-        req["id"] = str(req["_id"])
-        req.pop("_id", None)
-        result.append(FriendRequestResponse(**req))
+        # Get sender and recipient user info
+        sender = await db.users.find_one({"_id": ObjectId(req["sender_id"])})
+        recipient = await db.users.find_one({"_id": ObjectId(req["recipient_id"])})
+        
+        if sender and recipient:
+            result.append(FriendRequestResponse(
+                id=str(req["_id"]),
+                sender_id=req["sender_id"],
+                sender_username=sender["username"],
+                sender_email=sender["email"],
+                recipient_id=req["recipient_id"],
+                recipient_username=recipient["username"],
+                recipient_email=recipient["email"],
+                status=req["status"],
+                created_at=req["created_at"]
+            ))
     
     return result
 
