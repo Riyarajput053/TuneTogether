@@ -189,6 +189,84 @@ export const api = {
     });
     return data;
   },
+
+  async inviteFriendToSession(sessionId, friendId) {
+    const data = await this.request(`/api/sessions/${sessionId}/invite/${friendId}`, {
+      method: 'POST',
+    });
+    return data;
+  },
+
+  async getSessionInvitations() {
+    const data = await this.request('/api/sessions/invitations');
+    return data;
+  },
+
+  async acceptSessionInvitation(invitationId) {
+    const data = await this.request(`/api/sessions/invitations/${invitationId}/accept`, {
+      method: 'POST',
+    });
+    return data;
+  },
+
+  async rejectSessionInvitation(invitationId) {
+    const data = await this.request(`/api/sessions/invitations/${invitationId}/reject`, {
+      method: 'POST',
+    });
+    return data;
+  },
+
+  // Session Requests API
+  async requestToJoinSession(sessionId) {
+    const data = await this.request(`/api/sessions/${sessionId}/request`, {
+      method: 'POST',
+    });
+    return data;
+  },
+
+  async getSessionRequests(sessionId) {
+    const data = await this.request(`/api/sessions/requests/${sessionId}`);
+    return data;
+  },
+
+  async acceptSessionRequest(sessionId, requestId) {
+    const data = await this.request(`/api/sessions/requests/${sessionId}/${requestId}/accept`, {
+      method: 'POST',
+    });
+    return data;
+  },
+
+  async declineSessionRequest(sessionId, requestId) {
+    const data = await this.request(`/api/sessions/requests/${sessionId}/${requestId}/decline`, {
+      method: 'POST',
+    });
+    return data;
+  },
+
+  // Notifications API
+  async getNotifications() {
+    const data = await this.request('/api/notifications');
+    return data;
+  },
+
+  async getUnreadNotifications() {
+    const data = await this.request('/api/notifications/unread');
+    return data;
+  },
+
+  async markNotificationRead(notificationId) {
+    const data = await this.request(`/api/notifications/${notificationId}/read`, {
+      method: 'POST',
+    });
+    return data;
+  },
+
+  async markAllNotificationsRead() {
+    const data = await this.request('/api/notifications/read-all', {
+      method: 'POST',
+    });
+    return data;
+  },
 };
 
 export { getAuthToken, setAuthToken, removeAuthToken };

@@ -80,7 +80,7 @@ class SessionCreate(BaseModel):
     track_id: Optional[str] = None
     track_name: Optional[str] = None
     track_artist: Optional[str] = None
-    is_private: bool = False
+    privacy_type: str = "public"  # "public", "private", "friends"
 
 class SessionUpdate(BaseModel):
     name: Optional[str] = None
@@ -108,10 +108,50 @@ class SessionResponse(BaseModel):
     track_artist: Optional[str] = None
     is_playing: bool = False
     position_ms: int = 0
-    is_private: bool = False
+    privacy_type: str = "public"  # "public", "private", "friends"
     members: list[SessionMember] = []
     created_at: datetime
     updated_at: datetime
+    
+    class Config:
+        from_attributes = True
+
+# Session Invitation models
+class SessionInvitationResponse(BaseModel):
+    id: str
+    session_id: str
+    session_name: str
+    inviter_id: str
+    inviter_username: str
+    invitee_id: str
+    status: str  # "pending", "accepted", "rejected"
+    created_at: datetime
+    
+    class Config:
+        from_attributes = True
+
+# Session Request models (user requests to join)
+class SessionRequestResponse(BaseModel):
+    id: str
+    session_id: str
+    requester_id: str
+    requester_username: str
+    status: str  # "pending", "accepted", "declined"
+    created_at: datetime
+    
+    class Config:
+        from_attributes = True
+
+# Notification models
+class NotificationResponse(BaseModel):
+    id: str
+    user_id: str
+    type: str  # "request_accepted", "invitation", etc.
+    title: str
+    message: str
+    session_id: Optional[str] = None
+    is_read: bool = False
+    created_at: datetime
     
     class Config:
         from_attributes = True

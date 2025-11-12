@@ -1,6 +1,7 @@
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { Music, User, LogOut } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
+import NotificationBell from './NotificationBell';
 
 const Navigation = () => {
   const location = useLocation();
@@ -9,7 +10,10 @@ const Navigation = () => {
   
   const handleLogout = async () => {
     await logout();
-    navigate('/login');
+    // Clear any session state
+    navigate('/login', { replace: true });
+    // Force page reload to clear all state
+    window.location.href = '/login';
   };
   
   return (
@@ -58,6 +62,7 @@ const Navigation = () => {
         <div className="flex items-center space-x-4">
           {user ? (
             <>
+              <NotificationBell />
               <Link
                 to="/profile"
                 className={`flex items-center space-x-2 px-4 py-2 rounded-lg transition-all duration-300 ${

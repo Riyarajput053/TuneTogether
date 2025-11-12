@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useState, useRef } from 'react';
 import { io } from 'socket.io-client';
 import { getAuthToken } from '../utils/api';
+import { useAuth } from './AuthContext';
 
 const SocketContext = createContext(null);
 
@@ -15,12 +16,25 @@ export const useSocket = () => {
 };
 
 export const SocketProvider = ({ children }) => {
+  const { user } = useAuth();
   const [socket, setSocket] = useState(null);
   const [connected, setConnected] = useState(false);
   const [currentSessionId, setCurrentSessionId] = useState(null);
   const socketRef = useRef(null);
 
   useEffect(() => {
+    // Clear session state when user changes or logs out
+    if (!user) {
+      setCurrentSessionId(null);
+      if (socketRef.current) {
+        socketRef.current.disconnect();
+        socketRef.current = null;
+        setSocket(null);
+        setConnected(false);
+      }
+      return;
+    }
+
     // Initialize socket connection
     const token = getAuthToken();
     if (!token) {
@@ -45,6 +59,8 @@ export const SocketProvider = ({ children }) => {
     newSocket.on('connect', () => {
       console.log('Socket connected:', newSocket.id);
       setConnected(true);
+      // Clear any stale session state when connecting with a new user
+      setCurrentSessionId(null);
     });
 
     newSocket.on('connected', (data) => {
@@ -79,7 +95,7 @@ export const SocketProvider = ({ children }) => {
         newSocket.disconnect();
       }
     };
-  }, []);
+  }, [user]); // Reconnect when user changes
 
   const joinSession = async (sessionId) => {
     if (!socket || !connected) {
@@ -108,6 +124,7 @@ export const SocketProvider = ({ children }) => {
 
   const leaveSession = async (sessionId) => {
     if (!socket || !connected) {
+      setCurrentSessionId(null);
       return;
     }
 
@@ -117,6 +134,10 @@ export const SocketProvider = ({ children }) => {
         resolve();
       });
     });
+  };
+
+  const clearSession = () => {
+    setCurrentSessionId(null);
   };
 
   const sendMessage = (message) => {
@@ -150,7 +171,8 @@ export const SocketProvider = ({ children }) => {
         joinSession,
         leaveSession,
         sendMessage,
-        updateSession
+        updateSession,
+        clearSession
       }}
     >
       {children}
