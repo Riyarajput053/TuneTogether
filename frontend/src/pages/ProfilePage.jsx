@@ -1,11 +1,17 @@
-import { useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useEffect, useState } from 'react';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
-import { User, Mail, Calendar, LogOut } from 'lucide-react';
+import { api } from '../utils/api';
+import { User, Mail, Calendar, LogOut, Music, CheckCircle, XCircle } from 'lucide-react';
 
 export default function ProfilePage() {
   const { user, loading, logout } = useAuth();
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [spotifyStatus, setSpotifyStatus] = useState(null);
+  const [spotifyConnected, setSpotifyConnected] = useState(false);
+  const [checkingSpotify, setCheckingSpotify] = useState(true);
 
   useEffect(() => {
     if (!loading && !user) {
@@ -13,9 +19,76 @@ export default function ProfilePage() {
     }
   }, [user, loading, navigate]);
 
+  useEffect(() => {
+    // Check Spotify connection status when component loads
+    const checkSpotifyStatus = async () => {
+      if (!user) return;
+      try {
+        const status = await api.getSpotifyStatus();
+        setSpotifyConnected(status.connected);
+      } catch (error) {
+        console.error('Error checking Spotify status:', error);
+        setSpotifyConnected(false);
+      } finally {
+        setCheckingSpotify(false);
+      }
+    };
+
+    if (user) {
+      checkSpotifyStatus();
+    }
+  }, [user]);
+
+  useEffect(() => {
+    // Check for Spotify connection status in URL params
+    const connected = searchParams.get('spotify_connected');
+    const error = searchParams.get('spotify_error');
+    
+    if (connected === 'true') {
+      setSpotifyStatus({ type: 'success', message: 'Successfully connected to Spotify!' });
+      setSpotifyConnected(true);
+      // Clear the query parameter
+      searchParams.delete('spotify_connected');
+      setSearchParams(searchParams, { replace: true });
+      // Clear message after 5 seconds
+      setTimeout(() => setSpotifyStatus(null), 5000);
+      // Refresh Spotify status
+      api.getSpotifyStatus().then(status => {
+        setSpotifyConnected(status.connected);
+      }).catch(console.error);
+    } else if (error) {
+      const errorMessages = {
+        missing_parameters: 'Missing required parameters. Please try again.',
+        server_configuration: 'Server configuration error. Please contact support.',
+        invalid_state: 'Invalid state parameter. Please try again.',
+        token_exchange_failed: 'Failed to exchange authorization code for tokens. Please try again.',
+        no_access_token: 'No access token received from Spotify. Please try again.',
+      };
+      setSpotifyStatus({
+        type: 'error',
+        message: errorMessages[error] || `Error: ${error}`
+      });
+      // Clear the query parameter
+      searchParams.delete('spotify_error');
+      setSearchParams(searchParams, { replace: true });
+      // Clear message after 5 seconds
+      setTimeout(() => setSpotifyStatus(null), 5000);
+    }
+  }, [searchParams, setSearchParams]);
+
   const handleLogout = async () => {
     await logout();
     navigate('/login');
+  };
+
+  const handleConnectSpotify = async () => {
+    setIsConnecting(true);
+    try {
+      await api.connectSpotify();
+    } catch (error) {
+      console.error('Error connecting to Spotify:', error);
+      setIsConnecting(false);
+    }
   };
 
   if (loading) {
@@ -53,6 +126,23 @@ export default function ProfilePage() {
           </div>
 
           <div className="space-y-6">
+            {spotifyStatus && (
+              <div
+                className={`rounded-lg p-4 border ${
+                  spotifyStatus.type === 'success'
+                    ? 'bg-green-900/30 border-green-600 text-green-300'
+                    : 'bg-red-900/30 border-red-600 text-red-300'
+                } flex items-center space-x-2`}
+              >
+                {spotifyStatus.type === 'success' ? (
+                  <CheckCircle className="w-5 h-5" />
+                ) : (
+                  <XCircle className="w-5 h-5" />
+                )}
+                <span>{spotifyStatus.message}</span>
+              </div>
+            )}
+
             <div className="bg-gray-700/30 rounded-lg p-6 border border-gray-600">
               <div className="flex items-center space-x-3 mb-4">
                 <User className="w-5 h-5 text-purple-400" />
@@ -75,6 +165,40 @@ export default function ProfilePage() {
                 <h2 className="text-lg font-semibold text-white">Member Since</h2>
               </div>
               <p className="text-gray-300 text-lg">{formatDate(user.created_at)}</p>
+            </div>
+
+            <div className="bg-gray-700/30 rounded-lg p-6 border border-gray-600">
+              <div className="flex items-center space-x-3 mb-4">
+                <Music className="w-5 h-5 text-green-400" />
+                <h2 className="text-lg font-semibold text-white">Spotify Integration</h2>
+              </div>
+              {checkingSpotify ? (
+                <p className="text-gray-400">Checking connection status...</p>
+              ) : spotifyConnected ? (
+                <div className="space-y-3">
+                  <div className="flex items-center space-x-2 text-green-400">
+                    <CheckCircle className="w-5 h-5" />
+                    <span className="font-semibold">Connected to Spotify</span>
+                  </div>
+                  <button
+                    onClick={handleConnectSpotify}
+                    disabled={isConnecting}
+                    className="w-full bg-gray-600 hover:bg-gray-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white font-semibold py-3 px-4 rounded-lg transition duration-200 flex items-center justify-center space-x-2"
+                  >
+                    <Music className="w-5 h-5" />
+                    <span>{isConnecting ? 'Reconnecting...' : 'Reconnect Spotify'}</span>
+                  </button>
+                </div>
+              ) : (
+                <button
+                  onClick={handleConnectSpotify}
+                  disabled={isConnecting}
+                  className="w-full bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white font-semibold py-3 px-4 rounded-lg transition duration-200 flex items-center justify-center space-x-2"
+                >
+                  <Music className="w-5 h-5" />
+                  <span>{isConnecting ? 'Connecting...' : 'Connect Spotify'}</span>
+                </button>
+              )}
             </div>
 
             <button

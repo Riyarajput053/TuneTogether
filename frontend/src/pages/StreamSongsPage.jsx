@@ -1,380 +1,470 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { useLocation } from 'react-router-dom';
-import { motion } from 'framer-motion';
-import { MessageCircle, Users, Play, Pause, UserPlus, Check, X } from 'lucide-react';
-import MiniPlayer from '../components/MiniPlayer';
+import { 
+  Music, ListMusic, Sparkles, Search, Users, MessageCircle, 
+  Play, Pause, LogOut as LeaveIcon, Settings, Trash2
+} from 'lucide-react';
+import MusicPlayer from '../components/MusicPlayer';
+import PlaylistBrowser from '../components/PlaylistBrowser';
+import Recommendations from '../components/Recommendations';
+import Explore from '../components/Explore';
 import PrivacyTypeModal from '../components/PrivacyTypeModal';
 import InviteFriendsModal from '../components/InviteFriendsModal';
 import RequestSessionModal from '../components/RequestSessionModal';
 import { api } from '../utils/api';
 import { useSocket } from '../contexts/SocketContext';
 import { useAuth } from '../contexts/AuthContext';
+import { useSpotify } from '../contexts/SpotifyContext';
 
 const StreamSongsPage = () => {
   const { user } = useAuth();
   const location = useLocation();
-  const { socket, connected, joinSession, leaveSession, sendMessage, currentSessionId, clearSession } = useSocket();
-  const [isPlaying, setIsPlaying] = useState(false);
+  const { socket, connected, joinSession, leaveSession, sendMessage, currentSessionId, updateSession } = useSocket();
+  const { 
+    isReady, isPlaying, currentTrack, position, initializePlayer, 
+    syncToPosition, playTrack, pause, resume 
+  } = useSpotify();
+
+  // UI State
+  const [activeTab, setActiveTab] = useState('explore'); // explore, playlists, recommendations
   const [currentSong, setCurrentSong] = useState(null);
   const [sessions, setSessions] = useState([]);
   const [currentSession, setCurrentSession] = useState(null);
-  const [roomCode, setRoomCode] = useState('');
   const [messages, setMessages] = useState([]);
   const [messageInput, setMessageInput] = useState('');
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(null);
   const [showPrivacyModal, setShowPrivacyModal] = useState(false);
   const [showInviteModal, setShowInviteModal] = useState(false);
   const [showRequestModal, setShowRequestModal] = useState(false);
   const [selectedSession, setSelectedSession] = useState(null);
   const [invitations, setInvitations] = useState([]);
   const [sessionRequests, setSessionRequests] = useState([]);
+  const [notifications, setNotifications] = useState([]);
+  const [spotifyConnected, setSpotifyConnected] = useState(false);
+  
+  const positionUpdateIntervalRef = useRef(null);
   const messagesEndRef = useRef(null);
 
-  useEffect(() => {
-    loadSessions();
-    loadInvitations();
-    // Poll for new invitations every 5 seconds
-    const interval = setInterval(loadInvitations, 5000);
-    return () => clearInterval(interval);
-  }, []);
-
-  useEffect(() => {
-    // Clear session state when user changes or logs out
-    if (!user) {
-      setCurrentSession(null);
-      setCurrentSong(null);
-      setMessages([]);
-      clearSession();
-      return;
-    }
-
-    // Check if we're coming from a notification with session data
-    if (location.state?.session) {
-      setCurrentSession(location.state.session);
-      setCurrentSong(location.state.session);
-      // Clear the state to avoid re-using it
-      window.history.replaceState({}, document.title);
-    } else if (location.state?.sessionId) {
-      // If we have sessionId from navigation, load it
-      loadSessionById(location.state.sessionId);
-      window.history.replaceState({}, document.title);
-    } else if (currentSessionId && !currentSession && connected && user) {
-      // If we have a currentSessionId from socket but no currentSession, verify and load it
-      verifyAndLoadSession();
-    }
-  }, [location.state, currentSessionId, connected, user]);
-
-  const verifyAndLoadSession = async () => {
-    if (!currentSessionId || !user) return;
-    try {
-      const session = await api.getSession(currentSessionId);
-      // Verify user is actually a member or host of this session
-      const isHost = session.host_id === user.id;
-      const isMember = session.members?.some(m => m.user_id === user.id);
-      
-      if (isHost || isMember) {
-        setCurrentSession(session);
-        setCurrentSong(session);
-      } else {
-        // User is not a member, clear the session
-        clearSession();
-        setCurrentSession(null);
-        setCurrentSong(null);
-      }
-    } catch (err) {
-      console.error('Error loading current session:', err);
-      // If session doesn't exist or user doesn't have access, clear it
-      clearSession();
-      setCurrentSession(null);
-      setCurrentSong(null);
-    }
-  };
-
-  const loadSessionById = async (sessionId) => {
-    try {
-      const session = await api.getSession(sessionId);
-      setCurrentSession(session);
-      setCurrentSong(session);
-      if (connected) {
-        await joinSession(sessionId);
-      }
-    } catch (err) {
-      console.error('Error loading session:', err);
-    }
-  };
-
-
-  useEffect(() => {
-    // Clear session if user changes and they're not a member
-    if (currentSession && user) {
-      const isHost = currentSession.host_id === user.id;
-      const isMember = currentSession.members?.some(m => m.user_id === user.id);
-      
-      if (!isHost && !isMember) {
-        // User is not a member of this session, clear it
-        setCurrentSession(null);
-        setCurrentSong(null);
-        setMessages([]);
-        clearSession();
-        return;
-      }
-    }
-
-    if (currentSession && currentSession.host_id === user?.id) {
-      loadSessionRequests();
-      // Poll for new requests every 3 seconds when host is in session
-      const interval = setInterval(loadSessionRequests, 3000);
-      return () => clearInterval(interval);
-    }
-  }, [currentSession, user]);
-
-  useEffect(() => {
-    if (!socket) return;
-
-    // Listen for session updates
-    socket.on('session_updated', (data) => {
-      if (data.session_id === currentSessionId) {
-        setCurrentSession((prev) => ({
-          ...prev,
-          ...data.updates
-        }));
-      }
-    });
-
-    // Listen for user join/leave
-    socket.on('user_joined', (data) => {
-      setMessages((prev) => [
-        ...prev,
-        {
-          type: 'system',
-          message: `${data.username} joined the session`,
-          timestamp: new Date()
-        }
-      ]);
-    });
-
-    socket.on('user_left', (data) => {
-      setMessages((prev) => [
-        ...prev,
-        {
-          type: 'system',
-          message: `${data.username} left the session`,
-          timestamp: new Date()
-        }
-      ]);
-    });
-
-    // Listen for chat messages
-    socket.on('chat:message', (data) => {
-      // Only add message if it's not from current user (to avoid duplicates from optimistic update)
-      // Or if it's from another user
-      setMessages((prev) => {
-        // Check if this message was already added optimistically
-        const isDuplicate = prev.some(
-          (msg) => 
-            msg.type === 'user' && 
-            msg.username === data.username && 
-            msg.message === data.message &&
-            Math.abs(new Date(msg.timestamp) - new Date(data.timestamp || Date.now())) < 2000
-        );
-        
-        if (isDuplicate) {
-          // Replace optimistic message with server message (to get correct timestamp)
-          return prev.map((msg) => {
-            if (
-              msg.type === 'user' && 
-              msg.username === data.username && 
-              msg.message === data.message &&
-              Math.abs(new Date(msg.timestamp) - new Date(data.timestamp || Date.now())) < 2000
-            ) {
-              return {
-                ...msg,
-                timestamp: new Date(data.timestamp || Date.now())
-              };
-            }
-            return msg;
-          });
-        }
-        
-        return [
-          ...prev,
-          {
-            type: 'user',
-            username: data.username,
-            message: data.message,
-            timestamp: new Date(data.timestamp || Date.now())
-          }
-        ];
-      });
-    });
-
-    return () => {
-      socket.off('session_updated');
-      socket.off('user_joined');
-      socket.off('user_left');
-      socket.off('chat:message');
-    };
-  }, [socket, currentSessionId]);
-
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
-
-  const loadSessions = async () => {
+  // Load functions - defined early so they can be used in useEffect hooks
+  const loadSessions = useCallback(async () => {
     try {
       const data = await api.getSessions();
       setSessions(data);
     } catch (err) {
       console.error('Error loading sessions:', err);
     }
-  };
+  }, []);
 
-  const loadInvitations = async () => {
+  const loadInvitations = useCallback(async () => {
     try {
       const data = await api.getSessionInvitations();
       setInvitations(data);
     } catch (err) {
       console.error('Error loading invitations:', err);
     }
-  };
+  }, []);
 
-  const loadSessionRequests = async () => {
-    if (!currentSession || currentSession.host_id !== user?.id) return;
+  const loadSessionRequests = useCallback(async (sessionId) => {
+    if (!sessionId) return;
     try {
-      const data = await api.getSessionRequests(currentSession.id);
+      const data = await api.getSessionRequests(sessionId);
       setSessionRequests(data);
     } catch (err) {
       console.error('Error loading session requests:', err);
     }
-  };
+  }, []);
 
-  const handleStartJamClick = () => {
-    if (!user) {
-      setError('Please login to create a session');
+  const loadNotifications = useCallback(async () => {
+    try {
+      const data = await api.getUnreadNotifications();
+      setNotifications(data);
+    } catch (err) {
+      console.error('Error loading notifications:', err);
+    }
+  }, []);
+
+  // Initialize Spotify player
+  useEffect(() => {
+    const initSpotify = async () => {
+      try {
+        const status = await api.getSpotifyStatus();
+        if (status.connected) {
+          setSpotifyConnected(true);
+          await initializePlayer();
+        }
+      } catch (error) {
+        console.error('Error initializing Spotify:', error);
+      }
+    };
+    
+    if (user) {
+      initSpotify();
+    }
+  }, [user, initializePlayer]);
+
+  // Load sessions, invitations, and notifications
+  useEffect(() => {
+    if (user) {
+      loadSessions();
+      loadInvitations();
+      loadNotifications();
+      const interval = setInterval(() => {
+        loadSessions();
+        loadInvitations();
+        loadNotifications();
+      }, 5000);
+      return () => clearInterval(interval);
+    }
+  }, [user, loadSessions, loadInvitations, loadNotifications]);
+
+  // Load session requests when host is in a session
+  useEffect(() => {
+    const isHost = currentSession && user?.id === currentSession.host_id;
+    if (currentSession && isHost) {
+      loadSessionRequests(currentSession.id);
+      const interval = setInterval(() => {
+        loadSessionRequests(currentSession.id);
+      }, 3000);
+      return () => clearInterval(interval);
+    } else {
+      setSessionRequests([]);
+    }
+  }, [currentSession, user, loadSessionRequests]);
+
+  // Handle session updates from socket
+  useEffect(() => {
+    if (!socket) return;
+
+    const handleSessionUpdate = (data) => {
+      if (data.session_id === currentSessionId) {
+        const updates = data.updates;
+        
+        // Update current session state
+        setCurrentSession((prev) => ({
+          ...prev,
+          ...updates
+        }));
+
+        // If host updated track, sync guests
+        if (updates.track_id && currentSession && user?.id !== currentSession.host_id && isReady) {
+          const trackUri = `spotify:track:${updates.track_id}`;
+          syncToPosition(
+            trackUri,
+            updates.position_ms || 0,
+            updates.is_playing || false
+          );
+        }
+
+        // Update current song
+        if (updates.track_id) {
+          setCurrentSong({
+            id: updates.track_id,
+            name: updates.track_name,
+            artist: updates.track_artist,
+            position_ms: updates.position_ms || 0,
+          });
+        }
+      }
+    };
+
+    const handleUserJoined = (data) => {
+      setMessages((prev) => [
+        ...prev,
+        {
+          username: data.username,
+          message: `${data.username} joined the session`,
+          timestamp: new Date()
+        }
+      ]);
+    };
+
+    const handleUserLeft = (data) => {
+      setMessages((prev) => [
+        ...prev,
+        {
+          username: data.username,
+          message: `${data.username} left the session`,
+          timestamp: new Date()
+        }
+      ]);
+    };
+
+    const handleChatMessage = (data) => {
+      // Check if this is our own message (already added optimistically)
+      // If it's from the current user, we might have already added it, but we'll add it anyway
+      // to ensure consistency (the server timestamp is authoritative)
+      setMessages((prev) => {
+        // Check if we already have this message (to avoid duplicates)
+        const messageExists = prev.some(
+          msg => msg.username === data.username && 
+                 msg.message === data.message &&
+                 Math.abs(new Date(msg.timestamp).getTime() - new Date(data.timestamp || Date.now()).getTime()) < 2000
+        );
+        
+        if (messageExists) {
+          // Message already exists, just return previous state
+          return prev;
+        }
+        
+        // Add new message
+        return [
+          ...prev,
+          {
+            username: data.username,
+            message: data.message,
+            timestamp: new Date(data.timestamp || Date.now())
+          }
+        ];
+      });
+    };
+
+    const handleSessionInvitation = () => {
+      // Reload invitations when a new one is received
+      loadInvitations();
+    };
+
+    const handleSessionRequest = () => {
+      // Reload session requests when a new one is received (if host)
+      if (currentSession && user?.id === currentSession.host_id) {
+        loadSessionRequests(currentSession.id);
+      }
+    };
+
+    const handleNotification = () => {
+      // Reload notifications when a new one is received
+      loadNotifications();
+    };
+
+    socket.on('session_updated', handleSessionUpdate);
+    socket.on('user_joined', handleUserJoined);
+    socket.on('user_left', handleUserLeft);
+    socket.on('chat:message', handleChatMessage);
+    socket.on('session_invitation', handleSessionInvitation);
+    socket.on('session_request', handleSessionRequest);
+    socket.on('notification', handleNotification);
+
+    return () => {
+      socket.off('session_updated', handleSessionUpdate);
+      socket.off('user_joined', handleUserJoined);
+      socket.off('user_left', handleUserLeft);
+      socket.off('chat:message', handleChatMessage);
+      socket.off('session_invitation', handleSessionInvitation);
+      socket.off('session_request', handleSessionRequest);
+      socket.off('notification', handleNotification);
+    };
+  }, [socket, currentSessionId, currentSession, user, syncToPosition, isReady, loadInvitations, loadSessionRequests, loadNotifications]);
+
+  // Scroll messages to bottom
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
+
+  // Host: Send position updates to guests
+  useEffect(() => {
+    if (!currentSession || !user || user.id !== currentSession.host_id) {
+      if (positionUpdateIntervalRef.current) {
+        clearInterval(positionUpdateIntervalRef.current);
+        positionUpdateIntervalRef.current = null;
+      }
       return;
     }
+
+    // Host sends position updates every second
+    positionUpdateIntervalRef.current = setInterval(() => {
+      if (currentTrack && isReady && currentSessionId) {
+        updateSession({
+          track_id: currentTrack.id,
+          track_name: currentTrack.name,
+          track_artist: currentTrack.artist,
+          position_ms: position,
+          is_playing: isPlaying,
+        });
+      }
+    }, 1000);
+
+    return () => {
+      if (positionUpdateIntervalRef.current) {
+        clearInterval(positionUpdateIntervalRef.current);
+      }
+    };
+  }, [currentSession, user, currentTrack, position, isPlaying, isReady, currentSessionId, updateSession]);
+
+  // Handle track selection
+  const handleTrackSelect = useCallback(async (track) => {
+    setCurrentSong(track);
+    
+    // Use track.uri if available, otherwise construct it
+    const trackUri = track.uri || `spotify:track:${track.id}`;
+    
+    if (currentSession && user?.id === currentSession.host_id) {
+      // Host plays track and updates session
+      if (isReady) {
+        try {
+          await playTrack(trackUri, 0);
+          
+          // Update session
+          updateSession({
+            track_id: track.id,
+            track_name: track.name,
+            track_artist: track.artist,
+            position_ms: 0,
+            is_playing: true,
+          });
+        } catch (error) {
+          console.error('Error playing track:', error);
+        }
+      } else {
+        console.warn('Spotify player not ready');
+      }
+    } else if (!currentSession) {
+      // No session, just play locally
+      if (isReady) {
+        try {
+          await playTrack(trackUri, 0);
+        } catch (error) {
+          console.error('Error playing track:', error);
+        }
+      } else {
+        console.warn('Spotify player not ready');
+      }
+    }
+  }, [currentSession, user, isReady, playTrack, updateSession]);
+
+
+  const handleStartJam = () => {
+    if (!user) return;
     setShowPrivacyModal(true);
   };
 
-  const handleStartJam = async (privacyType) => {
+  const handleCreateSession = async (privacyType) => {
     setShowPrivacyModal(false);
     setLoading(true);
-    setError(null);
-
     try {
-      // Create session via REST API
       const sessionData = {
         name: `${user.username}'s Jam Session`,
         description: 'Join me for some great music!',
         platform: 'spotify',
         privacy_type: privacyType
       };
-
       const newSession = await api.createSession(sessionData);
-      
-      // Join session via socket
       if (connected) {
         await joinSession(newSession.id);
         setCurrentSession(newSession);
-        setCurrentSong(newSession);
+        setMessages([]); // New session, no messages yet
         await loadSessions();
-      } else {
-        setError('Socket not connected. Please refresh the page.');
       }
     } catch (err) {
-      setError(err.message || 'Failed to create session');
+      console.error('Error creating session:', err);
     } finally {
       setLoading(false);
     }
   };
 
-  const handleJoinJam = async () => {
-    if (!roomCode.trim()) {
-      setError('Please enter a session ID');
-      return;
-    }
-
-    setLoading(true);
-    setError(null);
-
+  const loadSessionMessages = useCallback(async (sessionId) => {
+    if (!sessionId) return;
     try {
-      // First join via REST API
-      const session = await api.joinSession(roomCode.trim());
-      
-      // Then join via socket
+      const data = await api.getSessionMessages(sessionId);
+      // Convert API response to message format
+      const formattedMessages = data.map(msg => ({
+        username: msg.username,
+        message: msg.message,
+        timestamp: new Date(msg.timestamp)
+      }));
+      setMessages(formattedMessages);
+    } catch (err) {
+      console.error('Error loading session messages:', err);
+    }
+  }, []);
+
+  const handleJoinSession = async (sessionId) => {
+    try {
+      const session = await api.getSession(sessionId);
       if (connected) {
-        await joinSession(session.id);
+        await joinSession(sessionId);
         setCurrentSession(session);
-        setCurrentSong(session);
-        setRoomCode('');
-        await loadSessions();
-      } else {
-        setError('Socket not connected. Please refresh the page.');
+        // Load chat history
+        await loadSessionMessages(sessionId);
+        if (session.track_id) {
+          setCurrentSong({
+            id: session.track_id,
+            name: session.track_name,
+            artist: session.track_artist,
+            position_ms: session.position_ms || 0,
+          });
+        }
       }
     } catch (err) {
-      setError(err.message || 'Failed to join session');
-    } finally {
-      setLoading(false);
+      console.error('Error joining session:', err);
     }
   };
 
   const handleLeaveSession = async () => {
-    if (!currentSession) return;
-
-    try {
-      if (currentSessionId) {
-        await leaveSession(currentSession.id);
-      }
-      await api.leaveSession(currentSession.id);
+    if (currentSessionId) {
+      await leaveSession(currentSessionId);
       setCurrentSession(null);
       setCurrentSong(null);
-      setMessages([]);
-      clearSession();
-      await loadSessions();
-    } catch (err) {
-      setError(err.message || 'Failed to leave session');
-      // Clear session state even on error
-      setCurrentSession(null);
-      setCurrentSong(null);
-      setMessages([]);
-      clearSession();
+      setMessages([]); // Clear messages when leaving
     }
   };
 
   const handleDeleteSession = async () => {
-    if (!currentSession) return;
+    if (!currentSession || !isHost) return;
 
     if (!window.confirm('Are you sure you want to delete this session? This action cannot be undone.')) {
       return;
     }
 
     try {
+      // Leave socket session first
       if (currentSessionId) {
-        await leaveSession(currentSession.id);
+        await leaveSession(currentSessionId);
       }
+      // Delete session via API
       await api.deleteSession(currentSession.id);
+      // Clear state
       setCurrentSession(null);
       setCurrentSong(null);
       setMessages([]);
-      clearSession();
+      // Reload sessions list
       await loadSessions();
     } catch (err) {
-      setError(err.message || 'Failed to delete session');
-      // Clear session state even on error
+      console.error('Error deleting session:', err);
+      // Clear state even on error
       setCurrentSession(null);
       setCurrentSong(null);
       setMessages([]);
-      clearSession();
     }
+  };
+
+  const handleSendMessage = () => {
+    if (!messageInput.trim() || !currentSessionId || !user) return;
+    
+    const messageText = messageInput.trim();
+    
+    // Add message to local state immediately for instant feedback
+    setMessages((prev) => [
+      ...prev,
+      {
+        username: user.username,
+        message: messageText,
+        timestamp: new Date()
+      }
+    ]);
+    
+    // Clear input
+    setMessageInput('');
+    
+    // Send message via socket
+    sendMessage(messageText);
   };
 
   const handleInviteFriend = async (friendId, sessionId) => {
     try {
       await api.inviteFriendToSession(sessionId, friendId);
-      // Just create invitation, don't update session yet
+      // Reload invitations to show updated state
+      await loadInvitations();
     } catch (err) {
-      setError(err.message || 'Failed to invite friend');
+      console.error('Error inviting friend:', err);
       throw err;
     }
   };
@@ -386,12 +476,21 @@ const StreamSongsPage = () => {
       if (connected) {
         await joinSession(session.id);
         setCurrentSession(session);
-        setCurrentSong(session);
+        // Load chat history
+        await loadSessionMessages(session.id);
+        if (session.track_id) {
+          setCurrentSong({
+            id: session.track_id,
+            name: session.track_name,
+            artist: session.track_artist,
+            position_ms: session.position_ms || 0,
+          });
+        }
       }
       await loadInvitations();
       await loadSessions();
     } catch (err) {
-      setError(err.message || 'Failed to accept invitation');
+      console.error('Error accepting invitation:', err);
     }
   };
 
@@ -400,408 +499,390 @@ const StreamSongsPage = () => {
       await api.rejectSessionInvitation(invitationId);
       await loadInvitations();
     } catch (err) {
-      setError(err.message || 'Failed to reject invitation');
+      console.error('Error rejecting invitation:', err);
     }
   };
 
-  const handleSessionCardClick = (session) => {
-    // Only show request modal for public or friends sessions
-    if (session.privacy_type === 'public' || session.privacy_type === 'friends') {
-      setSelectedSession(session);
-      setShowRequestModal(true);
-    } else {
-      // For private sessions, try to join directly (if already a member)
-      handleJoinSession(session);
-    }
-  };
-
-  const handleJoinSession = async (session) => {
-    try {
-      await api.joinSession(session.id);
-      if (connected) {
-        await joinSession(session.id);
-        setCurrentSession(session);
-        setCurrentSong(session);
-      }
-    } catch (err) {
-      setError(err.message);
-    }
-  };
-
-  const handleSendRequest = async (sessionId) => {
+  const handleRequestToJoin = async (sessionId) => {
     try {
       await api.requestToJoinSession(sessionId);
       setShowRequestModal(false);
       setSelectedSession(null);
-      setError(null);
+      await loadSessions();
     } catch (err) {
-      setError(err.message || 'Failed to send request');
+      console.error('Error requesting to join:', err);
+      alert(err.message || 'Failed to send request');
     }
   };
 
-  const handleAcceptRequest = async (request) => {
+  const handleAcceptRequest = async (requestId) => {
+    if (!currentSession) return;
     try {
-      const updatedSession = await api.acceptSessionRequest(currentSession.id, request.id);
+      const updatedSession = await api.acceptSessionRequest(currentSession.id, requestId);
       setCurrentSession(updatedSession);
-      await loadSessionRequests();
+      await loadSessionRequests(currentSession.id);
       await loadSessions();
+      // Messages are already loaded, no need to reload
     } catch (err) {
-      setError(err.message || 'Failed to accept request');
+      console.error('Error accepting request:', err);
     }
   };
 
   const handleDeclineRequest = async (requestId) => {
+    if (!currentSession) return;
     try {
       await api.declineSessionRequest(currentSession.id, requestId);
-      await loadSessionRequests();
+      await loadSessionRequests(currentSession.id);
     } catch (err) {
-      setError(err.message || 'Failed to decline request');
+      console.error('Error declining request:', err);
     }
   };
 
-  const handleSendMessage = (e) => {
-    e.preventDefault();
-    if (!messageInput.trim() || !currentSessionId || !user) return;
-
-    const messageText = messageInput.trim();
+  const handleSessionCardClick = (session) => {
+    // Check if user can join directly or needs to request
+    const isHost = session.host_id === user?.id;
+    const isMember = session.members?.some(m => m.user_id === user?.id);
     
-    // Optimistic update - show message immediately
-    setMessages((prev) => [
-      ...prev,
-      {
-        type: 'user',
-        username: user.username,
-        message: messageText,
-        timestamp: new Date()
-      }
-    ]);
-
-    try {
-      sendMessage(messageText);
-      setMessageInput('');
-    } catch (err) {
-      setError(err.message || 'Failed to send message');
-      // Remove the optimistic message on error
-      setMessages((prev) => prev.slice(0, -1));
+    if (isHost || isMember) {
+      // Can join directly
+      handleJoinSession(session.id);
+    } else if (session.privacy_type === 'public' || session.privacy_type === 'friends') {
+      // Need to request to join
+      setSelectedSession(session);
+      setShowRequestModal(true);
+    } else {
+      // Private session - can't join without invitation
+      alert('This is a private session. You need to be invited to join.');
     }
   };
 
-  const handlePlayPause = () => {
-    setIsPlaying(!isPlaying);
-    // TODO: Update session state via socket
+  const handleMarkNotificationRead = async (notificationId) => {
+    try {
+      await api.markNotificationRead(notificationId);
+      await loadNotifications();
+    } catch (err) {
+      console.error('Error marking notification as read:', err);
+    }
   };
 
-  const formatTime = (date) => {
-    if (!date) return '';
-    return new Date(date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  };
+  const isHost = currentSession && user?.id === currentSession.host_id;
 
   return (
-    <div className="min-h-screen bg-darker">
-      <div className="container mx-auto px-4 py-8">
-        {/* Header */}
-        <div className="text-center mb-12">
-          <h1 className="text-5xl font-bold mb-4 bg-gradient-to-r from-primary to-accent bg-clip-text text-transparent">
-            Listen Together on Spotify
-          </h1>
-          {!connected && (
-            <div className="bg-yellow-500/20 border border-yellow-500 text-yellow-200 px-4 py-2 rounded-lg inline-block mb-4">
-              Connecting to server...
-            </div>
-          )}
-        </div>
-
-        {error && (
-          <div className="bg-red-500/20 border border-red-500 text-red-200 px-4 py-3 rounded-lg mb-6">
-            {error}
-          </div>
-        )}
-
-        {/* Session Invitations */}
-        {invitations.length > 0 && !currentSession && (
-          <div className="mb-6 glass-effect rounded-2xl p-6">
-            <h3 className="text-xl font-semibold mb-4">Session Invitations</h3>
-            <div className="space-y-3">
-              {invitations.map((invitation) => (
-                <div
-                  key={invitation.id}
-                  className="bg-glass rounded-xl p-4 flex items-center justify-between"
-                >
-                  <div>
-                    <div className="font-semibold">{invitation.session_name}</div>
-                    <div className="text-sm text-gray-400">
-                      Invited by {invitation.inviter_username}
+    <div className="min-h-screen bg-gradient-to-br from-gray-900 via-purple-900 to-gray-900">
+      <div className="container mx-auto px-4 py-6">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          {/* Left Sidebar - Sessions & Chat */}
+          <div className="lg:col-span-1 space-y-6">
+            {/* Notifications */}
+            {notifications.length > 0 && (
+              <div className="bg-gray-800/50 backdrop-blur-sm rounded-2xl p-6 border border-gray-700">
+                <h3 className="text-white font-semibold text-lg mb-4">Notifications ({notifications.length})</h3>
+                <div className="space-y-2 max-h-48 overflow-y-auto">
+                  {notifications.map((notification) => (
+                    <div
+                      key={notification.id}
+                      onClick={() => {
+                        handleMarkNotificationRead(notification.id);
+                        if (notification.session_id) {
+                          handleJoinSession(notification.session_id);
+                        }
+                      }}
+                      className="bg-gray-700/50 rounded-lg p-3 cursor-pointer hover:bg-gray-700/70 transition-colors"
+                    >
+                      <div className="font-semibold text-white text-sm">{notification.title}</div>
+                      <div className="text-xs text-gray-400 mt-1">{notification.message}</div>
                     </div>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <button
-                      onClick={() => handleAcceptInvitation(invitation)}
-                      className="bg-primary hover:bg-green-600 text-white px-4 py-2 rounded-xl transition-colors"
-                    >
-                      Accept
-                    </button>
-                    <button
-                      onClick={() => handleRejectInvitation(invitation.id)}
-                      className="bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded-xl transition-colors"
-                    >
-                      Reject
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {currentSession ? (
-          <div className="mb-6 glass-effect rounded-2xl p-6">
-            <div className="flex items-center justify-between mb-4">
-              <div>
-                <h2 className="text-2xl font-semibold">{currentSession.name}</h2>
-                <p className="text-gray-400">{currentSession.description || 'No description'}</p>
-                <div className="flex items-center gap-4 mt-2">
-                  <span className="flex items-center gap-2 text-sm text-gray-400">
-                    <Users className="w-4 h-4" />
-                    {currentSession.members?.length || 0} members
-                  </span>
-                  <span className="text-sm text-gray-400">
-                    Host: {currentSession.host_username}
-                  </span>
-                </div>
-              </div>
-              <div className="flex items-center gap-3">
-                {currentSession.host_id === user?.id && (
-                  <button
-                    onClick={() => setShowInviteModal(true)}
-                    className="bg-primary hover:bg-green-600 text-white px-6 py-2 rounded-xl transition-colors flex items-center gap-2"
-                  >
-                    <UserPlus className="w-4 h-4" />
-                    Invite Friends
-                  </button>
-                )}
-                {currentSession.host_id === user?.id ? (
-                  <button
-                    onClick={handleDeleteSession}
-                    className="bg-red-500 hover:bg-red-600 text-white px-6 py-2 rounded-xl transition-colors"
-                  >
-                    Delete Session
-                  </button>
-                ) : (
-                  <button
-                    onClick={handleLeaveSession}
-                    className="bg-red-500 hover:bg-red-600 text-white px-6 py-2 rounded-xl transition-colors"
-                  >
-                    Leave Session
-                  </button>
-                )}
-              </div>
-            </div>
-          </div>
-        ) : (
-          <div className="flex flex-col sm:flex-row gap-4 mb-8">
-            <button 
-              onClick={handleStartJamClick}
-              disabled={loading || !connected}
-              className="flex-1 bg-accent hover:bg-blue-500 text-white py-3 px-6 rounded-xl font-semibold transition-all duration-300 hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {loading ? 'Creating...' : 'Start Jam'}
-            </button>
-            <div className="flex-1 flex gap-2">
-              <input
-                type="text"
-                placeholder="Enter session ID"
-                value={roomCode}
-                onChange={(e) => setRoomCode(e.target.value)}
-                className="flex-1 bg-glass border border-gray-600 rounded-xl px-4 py-3 focus:outline-none focus:border-primary"
-              />
-              <button 
-                onClick={handleJoinJam}
-                disabled={loading || !connected}
-                className="bg-primary hover:bg-green-600 text-white px-6 py-3 rounded-xl font-semibold transition-all duration-300 disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                {loading ? 'Joining...' : 'Join Session'}
-              </button>
-            </div>
-          </div>
-        )}
-
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-          {/* Main Content */}
-          <div className="lg:col-span-2">
-            {sessions.length > 0 && !currentSession && (
-              <div className="mb-8">
-                <h2 className="text-2xl font-semibold mb-4">Available Sessions</h2>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {sessions.slice(0, 6).map((session) => (
-                    <motion.div
-                      key={session.id}
-                      whileHover={{ scale: 1.02 }}
-                      className="bg-secondary rounded-2xl p-4 cursor-pointer hover:shadow-2xl transition-all duration-300"
-                      onClick={() => handleSessionCardClick(session)}
-                    >
-                      <h3 className="font-semibold text-lg mb-1">{session.name}</h3>
-                      <p className="text-gray-400 text-sm mb-2">{session.description || 'No description'}</p>
-                      <div className="flex items-center gap-4 text-xs text-gray-500">
-                        <span>{session.members?.length || 0} members</span>
-                        <span>{session.host_username}</span>
-                      </div>
-                    </motion.div>
                   ))}
                 </div>
               </div>
             )}
 
-            {currentSession && (
-              <>
-                {/* Pending Requests (Host View) */}
-                {currentSession.host_id === user?.id && sessionRequests.length > 0 && (
-                  <div className="glass-effect rounded-2xl p-6 mb-8">
-                    <h3 className="text-xl font-semibold mb-4">Pending Requests</h3>
-                    <div className="space-y-3">
-                      {sessionRequests.map((request) => (
-                        <div
-                          key={request.id}
-                          className="bg-glass rounded-xl p-4 flex items-center justify-between"
-                        >
-                          <div>
-                            <div className="font-semibold">{request.requester_username}</div>
-                            <div className="text-sm text-gray-400">wants to join your session</div>
-                          </div>
-                          <div className="flex items-center gap-2">
-                            <button
-                              onClick={() => handleAcceptRequest(request)}
-                              className="bg-primary hover:bg-green-600 text-white px-4 py-2 rounded-xl transition-colors flex items-center gap-2"
-                            >
-                              <Check className="w-4 h-4" />
-                              Accept
-                            </button>
-                            <button
-                              onClick={() => handleDeclineRequest(request.id)}
-                              className="bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded-xl transition-colors flex items-center gap-2"
-                            >
-                              <X className="w-4 h-4" />
-                              Decline
-                            </button>
-                          </div>
+            {/* Session Invitations */}
+            {invitations.length > 0 && !currentSession && (
+              <div className="bg-gray-800/50 backdrop-blur-sm rounded-2xl p-6 border border-gray-700">
+                <h3 className="text-white font-semibold text-lg mb-4">Session Invitations</h3>
+                <div className="space-y-3">
+                  {invitations.map((invitation) => (
+                    <div
+                      key={invitation.id}
+                      className="bg-gray-700/50 rounded-xl p-4 flex items-center justify-between"
+                    >
+                      <div>
+                        <div className="font-semibold text-white text-sm">{invitation.session_name}</div>
+                        <div className="text-xs text-gray-400">
+                          Invited by {invitation.inviter_username}
                         </div>
-                      ))}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => handleAcceptInvitation(invitation)}
+                          className="bg-green-600 hover:bg-green-700 text-white px-3 py-1.5 rounded-lg text-xs transition-colors"
+                        >
+                          Accept
+                        </button>
+                        <button
+                          onClick={() => handleRejectInvitation(invitation.id)}
+                          className="bg-red-500 hover:bg-red-600 text-white px-3 py-1.5 rounded-lg text-xs transition-colors"
+                        >
+                          Reject
+                        </button>
+                      </div>
                     </div>
-                  </div>
-                )}
-
-                <div className="glass-effect rounded-2xl p-6 mb-8">
-                  <h3 className="text-xl font-semibold mb-4">Now Playing</h3>
-                {currentSession.track_name ? (
-                  <div>
-                    <h4 className="text-lg font-semibold">{currentSession.track_name}</h4>
-                    <p className="text-gray-400">{currentSession.track_artist}</p>
-                    <div className="mt-4">
-                      <button
-                        onClick={handlePlayPause}
-                        className="bg-primary hover:bg-green-600 text-white px-6 py-2 rounded-xl transition-colors flex items-center gap-2"
-                      >
-                        {isPlaying ? <Pause className="w-5 h-5" /> : <Play className="w-5 h-5" />}
-                        {isPlaying ? 'Pause' : 'Play'}
-                      </button>
-                    </div>
-                  </div>
-                ) : (
-                  <p className="text-gray-400">No track selected</p>
-                )}
+                  ))}
                 </div>
-              </>
+              </div>
             )}
-          </div>
 
-          {/* Chat Sidebar */}
-          {currentSession && (
-            <div className="glass-effect rounded-2xl p-6 flex flex-col" style={{ height: '600px' }}>
-              <h3 className="text-xl font-semibold mb-4 flex items-center gap-2">
-                <MessageCircle className="w-5 h-5" />
-                Group Chat
-                <span className="text-sm text-gray-400 font-normal">
-                  ({currentSession.members?.length || 0} members)
-                </span>
-              </h3>
-              <div className="flex-1 overflow-y-auto mb-4 space-y-3 pr-2">
-                {messages.length === 0 ? (
-                  <p className="text-gray-400 text-center py-8">No messages yet. Start the conversation!</p>
+            {/* Sessions List */}
+            <div className="bg-gray-800/50 backdrop-blur-sm rounded-2xl p-6 border border-gray-700">
+              <div className="flex items-center justify-between mb-4">
+                <h2 className="text-white font-semibold text-lg flex items-center space-x-2">
+                  <Users className="w-5 h-5" />
+                  <span>Jam Sessions</span>
+                </h2>
+                <button
+                  onClick={handleStartJam}
+                  className="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg text-sm font-medium transition-colors"
+                >
+                  Start Jam
+                </button>
+              </div>
+              
+              <div className="space-y-2 max-h-64 overflow-y-auto">
+                {sessions.length === 0 ? (
+                  <p className="text-gray-400 text-sm">No active sessions</p>
                 ) : (
-                  messages.map((msg, idx) => {
-                    const isCurrentUser = msg.type === 'user' && msg.username === user?.username;
+                  sessions.map((session) => {
+                    const isHost = session.host_id === user?.id;
+                    const isMember = session.members?.some(m => m.user_id === user?.id);
+                    const canJoinDirectly = isHost || isMember;
+                    
                     return (
-                      <div
-                        key={idx}
-                        className={`rounded-xl p-3 ${
-                          msg.type === 'system' 
-                            ? 'text-center text-gray-400 text-sm bg-glass/50' 
-                            : isCurrentUser
-                            ? 'bg-primary/20 ml-4'
-                            : 'bg-glass mr-4'
+                      <button
+                        key={session.id}
+                        onClick={() => handleSessionCardClick(session)}
+                        className={`w-full text-left p-3 rounded-lg transition-colors ${
+                          currentSession?.id === session.id
+                            ? 'bg-green-600/20 border border-green-600'
+                            : 'hover:bg-gray-700/50'
                         }`}
                       >
-                        {msg.type === 'user' && (
-                          <div className={`font-semibold mb-1 ${
-                            isCurrentUser ? 'text-primary' : 'text-accent'
-                          }`}>
-                            {isCurrentUser ? 'You' : msg.username}
+                        <div className="flex items-center justify-between">
+                          <div>
+                            <p className="text-white font-medium text-sm">{session.name}</p>
+                            <p className="text-gray-400 text-xs">
+                              {session.host_username} • {session.members?.length || 0} members
+                            </p>
                           </div>
-                        )}
-                        <div className="text-white">{msg.message}</div>
-                        {msg.timestamp && (
-                          <div className="text-xs text-gray-500 mt-1">{formatTime(msg.timestamp)}</div>
-                        )}
-                      </div>
+                          {!canJoinDirectly && (session.privacy_type === 'public' || session.privacy_type === 'friends') && (
+                            <span className="text-xs text-yellow-400">Request</span>
+                          )}
+                        </div>
+                      </button>
                     );
                   })
                 )}
-                <div ref={messagesEndRef} />
               </div>
-              <form onSubmit={handleSendMessage} className="flex gap-2 mt-auto">
-                <input
-                  type="text"
-                  placeholder="Type a message..."
-                  value={messageInput}
-                  onChange={(e) => setMessageInput(e.target.value)}
-                  disabled={!connected || !currentSessionId}
-                  className="flex-1 bg-darker border border-gray-600 rounded-xl px-4 py-2 focus:outline-none focus:border-primary disabled:opacity-50 disabled:cursor-not-allowed"
-                />
-                <button
-                  type="submit"
-                  disabled={!connected || !currentSessionId || !messageInput.trim()}
-                  className="bg-primary hover:bg-green-600 text-white px-4 py-2 rounded-xl transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  Send
-                </button>
-              </form>
             </div>
-          )}
+
+            {/* Current Session Info */}
+            {currentSession && (
+              <div className="bg-gray-800/50 backdrop-blur-sm rounded-2xl p-6 border border-gray-700">
+                <div className="flex items-center justify-between mb-4">
+                  <h3 className="text-white font-semibold">{currentSession.name}</h3>
+                  <div className="flex items-center space-x-2">
+                    {isHost && (
+                      <button
+                        onClick={handleDeleteSession}
+                        className="p-2 hover:bg-red-600/20 rounded-lg transition-colors"
+                        title="Delete Session"
+                      >
+                        <Trash2 className="w-5 h-5 text-red-400" />
+                      </button>
+                    )}
+                    <button
+                      onClick={handleLeaveSession}
+                      className="p-2 hover:bg-gray-700 rounded-lg transition-colors"
+                      title={isHost ? "Leave Session" : "Leave Session"}
+                    >
+                      <LeaveIcon className="w-5 h-5 text-gray-400" />
+                    </button>
+                  </div>
+                </div>
+                {isHost && (
+                  <>
+                    <button
+                      onClick={() => setShowInviteModal(true)}
+                      className="w-full px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg text-sm font-medium transition-colors mb-4"
+                    >
+                      Invite Friends
+                    </button>
+                    
+                    {/* Pending Requests */}
+                    {sessionRequests.length > 0 && (
+                      <div className="mb-4">
+                        <h4 className="text-white font-medium text-sm mb-2">Pending Requests ({sessionRequests.length})</h4>
+                        <div className="space-y-2 max-h-32 overflow-y-auto">
+                          {sessionRequests.map((request) => (
+                            <div
+                              key={request.id}
+                              className="bg-gray-700/50 rounded-lg p-2 flex items-center justify-between"
+                            >
+                              <span className="text-white text-xs">{request.requester_username}</span>
+                              <div className="flex gap-1">
+                                <button
+                                  onClick={() => handleAcceptRequest(request.id)}
+                                  className="bg-green-600 hover:bg-green-700 text-white px-2 py-1 rounded text-xs"
+                                >
+                                  Accept
+                                </button>
+                                <button
+                                  onClick={() => handleDeclineRequest(request.id)}
+                                  className="bg-red-500 hover:bg-red-600 text-white px-2 py-1 rounded text-xs"
+                                >
+                                  Decline
+                                </button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </>
+                )}
+                
+                {/* Chat */}
+                <div className="border-t border-gray-700 pt-4 mt-4">
+                  <div className="flex items-center space-x-2 mb-2">
+                    <MessageCircle className="w-4 h-4 text-gray-400" />
+                    <h4 className="text-white font-medium text-sm">Chat</h4>
+                  </div>
+                  <div className="h-32 overflow-y-auto mb-2 space-y-1">
+                    {messages.map((msg, idx) => (
+                      <div key={idx} className="text-xs">
+                        <span className="text-gray-400">{msg.username}: </span>
+                        <span className="text-gray-300">{msg.message}</span>
+                      </div>
+                    ))}
+                    <div ref={messagesEndRef} />
+                  </div>
+                  <div className="flex space-x-2">
+                    <input
+                      type="text"
+                      value={messageInput}
+                      onChange={(e) => setMessageInput(e.target.value)}
+                      onKeyPress={(e) => e.key === 'Enter' && handleSendMessage()}
+                      placeholder="Type a message..."
+                      className="flex-1 px-3 py-1 bg-gray-700 border border-gray-600 rounded text-white text-sm focus:outline-none focus:border-green-500"
+                    />
+                    <button
+                      onClick={handleSendMessage}
+                      className="px-3 py-1 bg-green-600 hover:bg-green-700 text-white rounded text-sm"
+                    >
+                      Send
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Main Content - Music Player & Browse */}
+          <div className="lg:col-span-2 space-y-6">
+            {/* Music Player */}
+            {spotifyConnected && (
+              <MusicPlayer
+                track={currentSong}
+                isHost={isHost}
+                onPositionUpdate={(pos) => {
+                  if (isHost && currentSessionId) {
+                    updateSession({ position_ms: pos });
+                  }
+                }}
+              />
+            )}
+
+            {!spotifyConnected && (
+              <div className="bg-gray-800/50 backdrop-blur-sm rounded-2xl p-8 border border-gray-700 text-center">
+                <Music className="w-12 h-12 text-gray-600 mx-auto mb-4" />
+                <p className="text-gray-400 mb-4">Connect your Spotify account to start jamming</p>
+                <a
+                  href="/profile"
+                  className="inline-block px-6 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg font-medium transition-colors"
+                >
+                  Connect Spotify
+                </a>
+              </div>
+            )}
+
+            {/* Tabs */}
+            {spotifyConnected && (
+              <div className="bg-gray-800/50 backdrop-blur-sm rounded-2xl border border-gray-700">
+                <div className="flex border-b border-gray-700">
+                  <button
+                    onClick={() => setActiveTab('explore')}
+                    className={`flex-1 px-6 py-4 font-medium transition-colors ${
+                      activeTab === 'explore'
+                        ? 'text-white border-b-2 border-green-500'
+                        : 'text-gray-400 hover:text-white'
+                    }`}
+                  >
+                    <div className="flex items-center justify-center space-x-2">
+                      <Search className="w-5 h-5" />
+                      <span>Explore</span>
+                    </div>
+                  </button>
+                  <button
+                    onClick={() => setActiveTab('playlists')}
+                    className={`flex-1 px-6 py-4 font-medium transition-colors ${
+                      activeTab === 'playlists'
+                        ? 'text-white border-b-2 border-green-500'
+                        : 'text-gray-400 hover:text-white'
+                    }`}
+                  >
+                    <div className="flex items-center justify-center space-x-2">
+                      <ListMusic className="w-5 h-5" />
+                      <span>Playlists</span>
+                    </div>
+                  </button>
+                  <button
+                    onClick={() => setActiveTab('recommendations')}
+                    className={`flex-1 px-6 py-4 font-medium transition-colors ${
+                      activeTab === 'recommendations'
+                        ? 'text-white border-b-2 border-green-500'
+                        : 'text-gray-400 hover:text-white'
+                    }`}
+                  >
+                    <div className="flex items-center justify-center space-x-2">
+                      <Sparkles className="w-5 h-5" />
+                      <span>For You</span>
+                    </div>
+                  </button>
+                </div>
+
+                <div className="h-96 overflow-y-auto">
+                  {activeTab === 'explore' && <Explore onTrackSelect={handleTrackSelect} />}
+                  {activeTab === 'playlists' && <PlaylistBrowser onTrackSelect={handleTrackSelect} />}
+                  {activeTab === 'recommendations' && <Recommendations onTrackSelect={handleTrackSelect} />}
+                </div>
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
-      {currentSong && (
-        <MiniPlayer
-          currentSong={currentSong}
-          isPlaying={isPlaying}
-          onPlayPause={handlePlayPause}
-          onNext={() => {}}
-          onPrevious={() => {}}
-        />
-      )}
-
+      {/* Modals */}
       <PrivacyTypeModal
         isOpen={showPrivacyModal}
         onClose={() => setShowPrivacyModal(false)}
-        onSelect={handleStartJam}
+        onSelect={handleCreateSession}
       />
-
       <InviteFriendsModal
         isOpen={showInviteModal}
         onClose={() => setShowInviteModal(false)}
         sessionId={currentSession?.id}
         onInvite={handleInviteFriend}
       />
-
       <RequestSessionModal
         isOpen={showRequestModal}
         onClose={() => {
@@ -809,10 +890,11 @@ const StreamSongsPage = () => {
           setSelectedSession(null);
         }}
         session={selectedSession}
-        onRequest={handleSendRequest}
+        onRequest={handleRequestToJoin}
       />
     </div>
   );
 };
 
 export default StreamSongsPage;
+

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, status, Cookie, Response
+from fastapi import FastAPI, Depends, HTTPException, status, Cookie, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from contextlib import asynccontextmanager
@@ -15,6 +15,10 @@ from auth import verify_password, get_password_hash, create_access_token, verify
 from bson import ObjectId
 from config import settings
 import socketio
+import httpx
+import secrets
+import base64
+import urllib.parse
 
 security = HTTPBearer(auto_error=False)
 
@@ -275,6 +279,7 @@ async def chat_message(sid, data):
     # Verify user is in the session
     db = get_database()
     user_id = authenticated_users[sid]["user_id"]
+    username = authenticated_users[sid]["username"]
     session = await db.sessions.find_one({"_id": ObjectId(session_id)})
     
     if not session:
@@ -289,11 +294,21 @@ async def chat_message(sid, data):
         await sio.emit('error', {'message': 'You are not a member of this session'}, room=sid)
         return
     
+    # Store message in database
+    message_doc = {
+        "session_id": session_id,
+        "user_id": user_id,
+        "username": username,
+        "message": message,
+        "created_at": datetime.utcnow()
+    }
+    await db.chat_messages.insert_one(message_doc)
+    
     # Broadcast message to all session members
     await sio.emit('chat:message', {
         'session_id': session_id,
         'user_id': user_id,
-        'username': authenticated_users[sid]["username"],
+        'username': username,
         'message': message,
         'timestamp': datetime.utcnow().isoformat()
     }, room=f"session_{session_id}")
@@ -306,21 +321,35 @@ socket_app = socketio.ASGIApp(sio, socketio_path="/")
 # Mount the socket app in FastAPI at /socket.io
 app.mount("/socket.io", socket_app)
 
-async def get_current_user(token: Optional[str] = Cookie(None), credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
+async def get_current_user(
+    token: Optional[str] = Cookie(None),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+    token_query: Optional[str] = None
+):
     """Get current authenticated user"""
-    # Try to get token from cookie first, then from Authorization header
+    # Try to get token from query parameter first, then cookie, then Authorization header
     token_value = None
-    if token:
+    
+    # Check query parameter first
+    if token_query:
+        token_value = token_query
+    # Check cookie (ensure it's a string, not a Cookie object)
+    elif token and isinstance(token, str):
         token_value = token
-    elif credentials:
+    # Check Authorization header
+    elif credentials and credentials.credentials:
         token_value = credentials.credentials
     
-    if not token_value:
+    if not token_value or not isinstance(token_value, str):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Not authenticated",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    
+    # Remove Bearer prefix if present
+    if token_value.startswith('Bearer '):
+        token_value = token_value.split(' ', 1)[1]
     
     token_data = verify_token(token_value)
     if token_data is None:
@@ -913,6 +942,52 @@ async def get_session(
     
     return SessionResponse(**session)
 
+@app.get("/api/sessions/{session_id}/messages")
+async def get_session_messages(
+    session_id: str,
+    current_user: dict = Depends(get_current_user),
+    limit: int = 100
+):
+    """Get chat messages for a session"""
+    db = get_database()
+    current_user_id = str(current_user["_id"])
+    
+    session = await db.sessions.find_one({"_id": ObjectId(session_id)})
+    
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found"
+        )
+    
+    # Check if user has access
+    is_host = session["host_id"] == current_user_id
+    is_member = any(m["user_id"] == current_user_id for m in session.get("members", []))
+    
+    if not (is_host or is_member):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied"
+        )
+    
+    # Get messages from database
+    messages = await db.chat_messages.find({
+        "session_id": session_id
+    }).sort("created_at", 1).limit(limit).to_list(length=limit)
+    
+    result = []
+    for msg in messages:
+        result.append({
+            "id": str(msg["_id"]),
+            "session_id": msg["session_id"],
+            "user_id": msg["user_id"],
+            "username": msg["username"],
+            "message": msg["message"],
+            "timestamp": msg["created_at"].isoformat() if isinstance(msg["created_at"], datetime) else msg["created_at"]
+        })
+    
+    return result
+
 @app.post("/api/sessions/{session_id}/join", response_model=SessionResponse)
 async def join_session(
     session_id: str,
@@ -1070,6 +1145,17 @@ async def request_to_join_session(
     request.pop("_id", None)
     request["requester_username"] = current_user["username"]
     
+    # Send real-time notification to the host if they're connected
+    host_sids = [sid for sid, user_info in authenticated_users.items() if user_info["user_id"] == session["host_id"]]
+    for sid in host_sids:
+        await sio.emit('session_request', {
+            'request_id': request["id"],
+            'session_id': session_id,
+            'session_name': session["name"],
+            'requester_username': current_user["username"],
+            'requester_id': current_user_id
+        }, room=sid)
+    
     return SessionRequestResponse(**request)
 
 @app.get("/api/sessions/requests/{session_id}", response_model=list[SessionRequestResponse])
@@ -1210,7 +1296,19 @@ async def accept_session_request(
         "is_read": False,
         "created_at": datetime.utcnow()
     }
-    await db.notifications.insert_one(notification)
+    notification_result = await db.notifications.insert_one(notification)
+    notification_id = str(notification_result.inserted_id)
+    
+    # Send real-time notification to the requester if they're connected
+    requester_sids = [sid for sid, user_info in authenticated_users.items() if user_info["user_id"] == requester_id]
+    for sid in requester_sids:
+        await sio.emit('notification', {
+            'notification_id': notification_id,
+            'type': 'request_accepted',
+            'title': 'Request Accepted',
+            'message': f"Your request to join '{session['name']}' has been accepted!",
+            'session_id': session_id
+        }, room=sid)
     
     # Return updated session
     updated_session = await db.sessions.find_one({"_id": ObjectId(session_id)})
@@ -1539,6 +1637,17 @@ async def invite_friend_to_session(
     invitation["session_name"] = session["name"]
     invitation["inviter_username"] = current_user["username"]
     
+    # Send real-time notification to the invitee if they're connected
+    invitee_sids = [sid for sid, user_info in authenticated_users.items() if user_info["user_id"] == friend_id]
+    for sid in invitee_sids:
+        await sio.emit('session_invitation', {
+            'invitation_id': invitation["id"],
+            'session_id': session_id,
+            'session_name': session["name"],
+            'inviter_username': current_user["username"],
+            'inviter_id': current_user_id
+        }, room=sid)
+    
     return SessionInvitationResponse(**invitation)
 
 @app.post("/api/sessions/invitations/{invitation_id}/accept", response_model=SessionResponse)
@@ -1676,4 +1785,735 @@ async def delete_session(
     await db.sessions.delete_one({"_id": ObjectId(session_id)})
     
     return {"message": "Session deleted successfully"}
+
+# Spotify OAuth endpoints
+async def get_user_from_query_token(token: Optional[str] = Query(None)):
+    """Dependency to get user from query token parameter"""
+    # Only pass token_query if token is actually provided
+    if token:
+        return await get_current_user(token_query=token)
+    else:
+        # Fall back to cookie/auth header if no query token
+        return await get_current_user()
+
+@app.get("/spotify/connect")
+async def spotify_connect(current_user: dict = Depends(get_user_from_query_token)):
+    """Initiate Spotify OAuth flow"""
+    if not settings.spotify_client_id:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Spotify client ID not configured"
+        )
+    
+    # Generate state for CSRF protection
+    state = secrets.token_urlsafe(32)
+    
+    # Store state in user document temporarily
+    db = get_database()
+    current_user_id = str(current_user["_id"])
+    await db.users.update_one(
+        {"_id": ObjectId(current_user_id)},
+        {"$set": {"spotify_oauth_state": state}}
+    )
+    
+    # Spotify OAuth scopes
+    scopes = [
+        "user-read-private",
+        "user-read-email",
+        "user-read-playback-state",
+        "user-modify-playback-state",
+        "user-read-currently-playing",
+        "streaming"
+    ]
+    
+    # Build authorization URL
+    auth_url = (
+        "https://accounts.spotify.com/authorize?"
+        f"client_id={settings.spotify_client_id}&"
+        f"response_type=code&"
+        f"redirect_uri={urllib.parse.quote(settings.spotify_redirect_uri)}&"
+        f"scope={urllib.parse.quote(' '.join(scopes))}&"
+        f"state={state}"
+    )
+    
+    # Redirect to Spotify
+    from fastapi.responses import RedirectResponse
+    print(f"Redirecting to Spotify: {auth_url}")  # Debug log
+    return RedirectResponse(url=auth_url, status_code=302)
+
+@app.get("/spotify/callback")
+async def spotify_callback(
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None
+):
+    """Handle Spotify OAuth callback"""
+    if error:
+        from fastapi.responses import RedirectResponse
+        frontend_url = settings.frontend_url
+        return RedirectResponse(url=f"{frontend_url}/profile?spotify_error={urllib.parse.quote(error)}")
+    
+    if not code or not state:
+        from fastapi.responses import RedirectResponse
+        frontend_url = settings.frontend_url
+        return RedirectResponse(url=f"{frontend_url}/profile?spotify_error=missing_parameters")
+    
+    if not settings.spotify_client_id or not settings.spotify_client_secret:
+        from fastapi.responses import RedirectResponse
+        frontend_url = settings.frontend_url
+        return RedirectResponse(url=f"{frontend_url}/profile?spotify_error=server_configuration")
+    
+    db = get_database()
+    
+    # Find user by state (state is stored in user document)
+    user = await db.users.find_one({"spotify_oauth_state": state})
+    if not user:
+        from fastapi.responses import RedirectResponse
+        frontend_url = settings.frontend_url
+        return RedirectResponse(url=f"{frontend_url}/profile?spotify_error=invalid_state")
+    
+    current_user_id = str(user["_id"])
+    
+    # Exchange code for tokens
+    token_url = "https://accounts.spotify.com/api/token"
+    token_data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": settings.spotify_redirect_uri,
+    }
+    
+    # Base64 encode client_id:client_secret
+    credentials = f"{settings.spotify_client_id}:{settings.spotify_client_secret}"
+    encoded_credentials = base64.b64encode(credentials.encode()).decode()
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            token_url,
+            data=token_data,
+            headers={
+                "Authorization": f"Basic {encoded_credentials}",
+                "Content-Type": "application/x-www-form-urlencoded"
+            }
+        )
+    
+    if response.status_code != 200:
+        from fastapi.responses import RedirectResponse
+        frontend_url = settings.frontend_url
+        return RedirectResponse(url=f"{frontend_url}/profile?spotify_error=token_exchange_failed")
+    
+    token_response = response.json()
+    access_token = token_response.get("access_token")
+    refresh_token = token_response.get("refresh_token")
+    expires_in = token_response.get("expires_in", 3600)
+    
+    if not access_token:
+        from fastapi.responses import RedirectResponse
+        frontend_url = settings.frontend_url
+        return RedirectResponse(url=f"{frontend_url}/profile?spotify_error=no_access_token")
+    
+    # Calculate expiration time
+    expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+    
+    # Store tokens in user document
+    await db.users.update_one(
+        {"_id": ObjectId(current_user_id)},
+        {
+            "$set": {
+                "spotify_access_token": access_token,
+                "spotify_refresh_token": refresh_token,
+                "spotify_token_expires_at": expires_at,
+                "spotify_connected_at": datetime.utcnow()
+            },
+            "$unset": {"spotify_oauth_state": ""}
+        }
+    )
+    
+    # Redirect back to frontend
+    from fastapi.responses import RedirectResponse
+    frontend_url = settings.frontend_url
+    print(f"Spotify connection successful for user {current_user_id}")  # Debug log
+    return RedirectResponse(url=f"{frontend_url}/profile?spotify_connected=true", status_code=302)
+
+@app.get("/api/spotify/status")
+async def get_spotify_status(current_user: dict = Depends(get_current_user)):
+    """Check if user has Spotify connected"""
+    db = get_database()
+    current_user_id = str(current_user["_id"])
+    
+    user = await db.users.find_one({"_id": ObjectId(current_user_id)})
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    has_spotify = bool(user.get("spotify_access_token"))
+    connected_at = user.get("spotify_connected_at")
+    
+    return {
+        "connected": has_spotify,
+        "connected_at": connected_at.isoformat() if connected_at else None
+    }
+
+@app.get("/api/spotify/token")
+async def get_spotify_token(current_user: dict = Depends(get_current_user)):
+    """Get user's Spotify access token"""
+    db = get_database()
+    current_user_id = str(current_user["_id"])
+    
+    user = await db.users.find_one({"_id": ObjectId(current_user_id)})
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    access_token = user.get("spotify_access_token")
+    if not access_token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Spotify not connected"
+        )
+    
+    # Check if token is expired and refresh if needed
+    expires_at = user.get("spotify_token_expires_at")
+    if expires_at and expires_at < datetime.utcnow():
+        # Token expired, refresh it
+        refresh_token = user.get("spotify_refresh_token")
+        if not refresh_token:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Spotify token expired and no refresh token available"
+            )
+        
+        # Refresh the token
+        token_url = "https://accounts.spotify.com/api/token"
+        token_data = {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        }
+        
+        credentials = f"{settings.spotify_client_id}:{settings.spotify_client_secret}"
+        encoded_credentials = base64.b64encode(credentials.encode()).decode()
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                token_url,
+                data=token_data,
+                headers={
+                    "Authorization": f"Basic {encoded_credentials}",
+                    "Content-Type": "application/x-www-form-urlencoded"
+                }
+            )
+        
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Failed to refresh Spotify token"
+            )
+        
+        token_response = response.json()
+        access_token = token_response.get("access_token")
+        expires_in = token_response.get("expires_in", 3600)
+        expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+        
+        # Update token in database
+        await db.users.update_one(
+            {"_id": ObjectId(current_user_id)},
+            {
+                "$set": {
+                    "spotify_access_token": access_token,
+                    "spotify_token_expires_at": expires_at
+                }
+            }
+        )
+    
+    return {"access_token": access_token}
+
+@app.get("/api/spotify/playlists")
+async def get_spotify_playlists(current_user: dict = Depends(get_current_user)):
+    """Get user's Spotify playlists"""
+    db = get_database()
+    current_user_id = str(current_user["_id"])
+    
+    user = await db.users.find_one({"_id": ObjectId(current_user_id)})
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    access_token = user.get("spotify_access_token")
+    if not access_token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Spotify not connected"
+        )
+    
+    # Get playlists from Spotify API
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            "https://api.spotify.com/v1/me/playlists",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"limit": 50}
+        )
+    
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to fetch playlists: {response.text}"
+        )
+    
+    return response.json()
+
+@app.get("/api/spotify/playlists/{playlist_id}/tracks")
+async def get_playlist_tracks(
+    playlist_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get tracks from a Spotify playlist"""
+    db = get_database()
+    current_user_id = str(current_user["_id"])
+    
+    user = await db.users.find_one({"_id": ObjectId(current_user_id)})
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    access_token = user.get("spotify_access_token")
+    if not access_token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Spotify not connected"
+        )
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"limit": 100}
+        )
+    
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to fetch playlist tracks: {response.text}"
+        )
+    
+    return response.json()
+
+@app.get("/api/spotify/recommendations")
+async def get_spotify_recommendations(
+    seed_genres: Optional[str] = None,
+    seed_artists: Optional[str] = None,
+    seed_tracks: Optional[str] = None,
+    limit: int = 20,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get Spotify recommendations"""
+    db = get_database()
+    current_user_id = str(current_user["_id"])
+    
+    user = await db.users.find_one({"_id": ObjectId(current_user_id)})
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    access_token = user.get("spotify_access_token")
+    if not access_token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Spotify not connected"
+        )
+    
+    params = {"limit": limit}
+    if seed_genres:
+        params["seed_genres"] = seed_genres
+    if seed_artists:
+        params["seed_artists"] = seed_artists
+    if seed_tracks:
+        params["seed_tracks"] = seed_tracks
+    
+    # Validate that at least one seed parameter is provided
+    if not seed_genres and not seed_artists and not seed_tracks:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one seed parameter (seed_genres, seed_artists, or seed_tracks) is required"
+        )
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            "https://api.spotify.com/v1/recommendations",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params=params
+        )
+    
+    if response.status_code != 200:
+        error_text = response.text
+        try:
+            error_json = response.json()
+            error_message = error_json.get("error", {}).get("message", error_text)
+        except:
+            error_message = error_text
+        
+        print(f"Spotify recommendations API error: {response.status_code} - {error_message}")
+        print(f"Request params: {params}")
+        
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to fetch recommendations: {error_message}"
+        )
+    
+    return response.json()
+
+@app.get("/api/spotify/search")
+async def search_spotify(
+    q: str,
+    type: str = "track",
+    limit: int = 20,
+    current_user: dict = Depends(get_current_user)
+):
+    """Search Spotify"""
+    db = get_database()
+    current_user_id = str(current_user["_id"])
+    
+    user = await db.users.find_one({"_id": ObjectId(current_user_id)})
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    access_token = user.get("spotify_access_token")
+    if not access_token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Spotify not connected"
+        )
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            "https://api.spotify.com/v1/search",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"q": q, "type": type, "limit": limit}
+        )
+    
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to search: {response.text}"
+        )
+    
+    return response.json()
+
+@app.get("/api/spotify/popular")
+async def get_popular_songs(
+    limit: int = 50,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get popular songs from Spotify's Global Top 50 playlist"""
+    db = get_database()
+    current_user_id = str(current_user["_id"])
+    
+    user = await db.users.find_one({"_id": ObjectId(current_user_id)})
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    access_token = user.get("spotify_access_token")
+    if not access_token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Spotify not connected"
+        )
+    
+    async with httpx.AsyncClient() as client:
+        # First, search for Global Top 50 playlist
+        search_response = await client.get(
+            "https://api.spotify.com/v1/search",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"q": "Global Top 50", "type": "playlist", "limit": 1}
+        )
+        
+        if search_response.status_code != 200:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Failed to find popular playlist: {search_response.text}"
+            )
+        
+        search_data = search_response.json()
+        playlists = search_data.get("playlists", {}).get("items", [])
+        
+        if not playlists:
+            # Fallback: Get featured playlists
+            featured_response = await client.get(
+                "https://api.spotify.com/v1/browse/featured-playlists",
+                headers={"Authorization": f"Bearer {access_token}"},
+                params={"limit": 1}
+            )
+            
+            if featured_response.status_code != 200:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Failed to fetch featured playlists: {featured_response.text}"
+                )
+            
+            featured_data = featured_response.json()
+            playlists = featured_data.get("playlists", {}).get("items", [])
+        
+        if not playlists:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No popular playlists found"
+            )
+        
+        playlist_id = playlists[0]["id"]
+        
+        # Get tracks from the playlist
+        tracks_response = await client.get(
+            f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"limit": limit, "fields": "items(track(id,name,artists,album,uri,duration_ms,popularity))"}
+        )
+        
+        if tracks_response.status_code != 200:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Failed to fetch playlist tracks: {tracks_response.text}"
+            )
+        
+        tracks_data = tracks_response.json()
+        tracks = [item["track"] for item in tracks_data.get("items", []) if item.get("track")]
+        
+        return {"tracks": tracks}
+
+@app.get("/api/spotify/latest")
+async def get_latest_songs(
+    limit: int = 50,
+    country: str = "US",
+    current_user: dict = Depends(get_current_user)
+):
+    """Get latest/new releases from Spotify"""
+    db = get_database()
+    current_user_id = str(current_user["_id"])
+    
+    user = await db.users.find_one({"_id": ObjectId(current_user_id)})
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    access_token = user.get("spotify_access_token")
+    if not access_token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Spotify not connected"
+        )
+    
+    async with httpx.AsyncClient() as client:
+        # Get new releases (albums)
+        new_releases_response = await client.get(
+            "https://api.spotify.com/v1/browse/new-releases",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"limit": 20, "country": country}
+        )
+        
+        if new_releases_response.status_code != 200:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Failed to fetch new releases: {new_releases_response.text}"
+            )
+        
+        new_releases_data = new_releases_response.json()
+        albums = new_releases_data.get("albums", {}).get("items", [])
+        
+        # Get tracks from the latest albums
+        all_tracks = []
+        for album in albums[:10]:  # Limit to first 10 albums to avoid too many requests
+            album_id = album["id"]
+            album_tracks_response = await client.get(
+                f"https://api.spotify.com/v1/albums/{album_id}/tracks",
+                headers={"Authorization": f"Bearer {access_token}"},
+                params={"limit": 5}  # Get first 5 tracks from each album
+            )
+            
+            if album_tracks_response.status_code == 200:
+                album_tracks_data = album_tracks_response.json()
+                tracks = album_tracks_data.get("items", [])
+                
+                # Enrich tracks with album info
+                for track in tracks:
+                    if track and track.get("id"):  # Ensure track is valid
+                        # Ensure track has all required fields
+                        enriched_track = {
+                            "id": track.get("id"),
+                            "name": track.get("name"),
+                            "artists": track.get("artists", []),
+                            "uri": track.get("uri"),
+                            "duration_ms": track.get("duration_ms", 0),
+                            "album": {
+                                "id": album["id"],
+                                "name": album["name"],
+                                "images": album.get("images", []),
+                                "release_date": album.get("release_date")
+                            }
+                        }
+                        all_tracks.append(enriched_track)
+                    
+                    if len(all_tracks) >= limit:
+                        break
+            
+            if len(all_tracks) >= limit:
+                break
+        
+        return {"tracks": all_tracks[:limit]}
+
+@app.get("/api/spotify/categories")
+async def get_spotify_categories(
+    country: str = "US",
+    limit: int = 20,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get Spotify categories (genres/moods)"""
+    db = get_database()
+    current_user_id = str(current_user["_id"])
+    
+    user = await db.users.find_one({"_id": ObjectId(current_user_id)})
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    access_token = user.get("spotify_access_token")
+    if not access_token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Spotify not connected"
+        )
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            "https://api.spotify.com/v1/browse/categories",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"country": country, "limit": limit}
+        )
+        
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Failed to fetch categories: {response.text}"
+            )
+        
+        return response.json()
+
+@app.get("/api/spotify/categories/{category_id}/playlists")
+async def get_category_playlists(
+    category_id: str,
+    country: str = "US",
+    limit: int = 20,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get playlists for a specific category"""
+    db = get_database()
+    current_user_id = str(current_user["_id"])
+    
+    user = await db.users.find_one({"_id": ObjectId(current_user_id)})
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    access_token = user.get("spotify_access_token")
+    if not access_token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Spotify not connected"
+        )
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"https://api.spotify.com/v1/browse/categories/{category_id}/playlists",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"country": country, "limit": limit}
+        )
+        
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Failed to fetch category playlists: {response.text}"
+            )
+        
+        return response.json()
+
+@app.get("/api/spotify/category-tracks")
+async def get_category_tracks(
+    category: str,
+    limit: int = 20,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get tracks from a category by searching for playlists with that category name"""
+    db = get_database()
+    current_user_id = str(current_user["_id"])
+    
+    user = await db.users.find_one({"_id": ObjectId(current_user_id)})
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    access_token = user.get("spotify_access_token")
+    if not access_token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Spotify not connected"
+        )
+    
+    async with httpx.AsyncClient() as client:
+        # Search for playlists with the category name
+        search_response = await client.get(
+            "https://api.spotify.com/v1/search",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"q": category, "type": "playlist", "limit": 5}
+        )
+        
+        if search_response.status_code != 200:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Failed to search playlists: {search_response.text}"
+            )
+        
+        search_data = search_response.json()
+        playlists = search_data.get("playlists", {}).get("items", [])
+        
+        if not playlists:
+            return {"tracks": []}
+        
+        # Get tracks from the first playlist
+        playlist_id = playlists[0]["id"]
+        tracks_response = await client.get(
+            f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"limit": limit, "fields": "items(track(id,name,artists,album,uri,duration_ms,popularity))"}
+        )
+        
+        if tracks_response.status_code != 200:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Failed to fetch playlist tracks: {tracks_response.text}"
+            )
+        
+        tracks_data = tracks_response.json()
+        tracks = [item["track"] for item in tracks_data.get("items", []) if item.get("track")]
+        
+        return {"tracks": tracks}
 

@@ -161,6 +161,11 @@ export const api = {
     return data;
   },
 
+  async getSessionMessages(sessionId) {
+    const data = await this.request(`/api/sessions/${sessionId}/messages`);
+    return data;
+  },
+
   async joinSession(sessionId) {
     const data = await this.request(`/api/sessions/${sessionId}/join`, {
       method: 'POST',
@@ -265,6 +270,78 @@ export const api = {
     const data = await this.request('/api/notifications/read-all', {
       method: 'POST',
     });
+    return data;
+  },
+
+  // Spotify API
+  async connectSpotify() {
+    // Get token from localStorage and append to URL for authentication
+    const token = getAuthToken();
+    if (!token) {
+      throw new Error('Not authenticated. Please login first.');
+    }
+    // This will redirect to the backend endpoint which redirects to Spotify
+    window.location.href = `${API_BASE_URL}/spotify/connect?token=${encodeURIComponent(token)}`;
+  },
+
+  async getSpotifyStatus() {
+    const data = await this.request('/api/spotify/status');
+    return data;
+  },
+
+  async getSpotifyToken() {
+    const data = await this.request('/api/spotify/token');
+    return data;
+  },
+
+  async getSpotifyPlaylists() {
+    const data = await this.request('/api/spotify/playlists');
+    return data;
+  },
+
+  async getPlaylistTracks(playlistId) {
+    const data = await this.request(`/api/spotify/playlists/${playlistId}/tracks`);
+    return data;
+  },
+
+  async getSpotifyRecommendations(params = {}) {
+    const queryParams = new URLSearchParams();
+    if (params.seed_genres) queryParams.append('seed_genres', params.seed_genres);
+    if (params.seed_artists) queryParams.append('seed_artists', params.seed_artists);
+    if (params.seed_tracks) queryParams.append('seed_tracks', params.seed_tracks);
+    if (params.limit) queryParams.append('limit', params.limit);
+    const query = queryParams.toString();
+    const data = await this.request(`/api/spotify/recommendations${query ? '?' + query : ''}`);
+    return data;
+  },
+
+  async searchSpotify(query, type = 'track', limit = 20) {
+    const data = await this.request(`/api/spotify/search?q=${encodeURIComponent(query)}&type=${type}&limit=${limit}`);
+    return data;
+  },
+
+  async getPopularSongs(limit = 50) {
+    const data = await this.request(`/api/spotify/popular?limit=${limit}`);
+    return data;
+  },
+
+  async getLatestSongs(limit = 50, country = 'US') {
+    const data = await this.request(`/api/spotify/latest?limit=${limit}&country=${country}`);
+    return data;
+  },
+
+  async getSpotifyCategories(country = 'US', limit = 20) {
+    const data = await this.request(`/api/spotify/categories?country=${country}&limit=${limit}`);
+    return data;
+  },
+
+  async getCategoryPlaylists(categoryId, country = 'US', limit = 20) {
+    const data = await this.request(`/api/spotify/categories/${categoryId}/playlists?country=${country}&limit=${limit}`);
+    return data;
+  },
+
+  async getCategoryTracks(category, limit = 20) {
+    const data = await this.request(`/api/spotify/category-tracks?category=${encodeURIComponent(category)}&limit=${limit}`);
     return data;
   },
 };

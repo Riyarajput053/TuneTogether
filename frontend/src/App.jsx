@@ -1,6 +1,7 @@
 import { BrowserRouter, Routes, Route } from 'react-router-dom';
 import { AuthProvider } from './contexts/AuthContext';
 import { SocketProvider } from './contexts/SocketContext';
+import { SpotifyProvider } from './contexts/SpotifyContext';
 import Navigation from './components/Navigation';
 import StreamSongsPage from './pages/StreamSongsPage';
 import StreamMoviesPage from './pages/StreamMoviesPage';
@@ -14,7 +15,8 @@ function App() {
   return (
     <AuthProvider>
       <SocketProvider>
-        <BrowserRouter>
+        <SpotifyProvider>
+          <BrowserRouter>
           <Routes>
             <Route path="/login" element={<LoginPage />} />
             <Route path="/signup" element={<SignupPage />} />
@@ -51,6 +53,7 @@ function App() {
             />
           </Routes>
         </BrowserRouter>
+        </SpotifyProvider>
       </SocketProvider>
     </AuthProvider>
   );
